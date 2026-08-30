@@ -1,0 +1,13 @@
+# build output
+/bin/
+/dist/
+
+# benchmark results are large and machine-specific; publish curated ones only
+/bench/results/
+*.perf
+perf.data*
+
+# editor / OS
+.DS_Store
+.idea/
+.vscode/
