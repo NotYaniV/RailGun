@@ -1,0 +1,19 @@
+Running 1m test @ http://10.0.0.5:8080
+  8 threads and 256 connections
+  Thread calibration: mean lat.: 1.204ms, rate sampling interval: 10ms
+  Thread calibration: mean lat.: 1.198ms, rate sampling interval: 10ms
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     1.35ms  890.00us  21.06ms   85.10%
+    Req/Sec     6.29k   512.00     7.10k    70.20%
+  Latency Distribution (HdrHistogram - Recorded Latency)
+ 50.000%    1.20ms
+ 75.000%    1.81ms
+ 90.000%    2.40ms
+ 99.000%    5.62ms
+ 99.900%   12.31ms
+ 99.990%   18.05ms
+ 99.999%   20.61ms
+100.000%   21.06ms
+  2999871 requests in 1.00m, 3.05GB read
+Requests/sec:  49997.85
+Transfer/sec:     52.08MB
