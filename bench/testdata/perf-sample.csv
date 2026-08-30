@@ -1,0 +1,6 @@
+412938174562,,cycles,60000112233,100.00,,
+2871234,,LLC-load-misses,60000112233,100.00,,
+198234112,,LLC-loads,60000112233,100.00,,
+14992355,,raw_syscalls:sys_enter,60000112233,100.00,,
+2999871,,syscalls:sys_enter_splice,60000112233,100.00,,
+<not counted>,,uncore_imc/data_reads/,0,0.00,,
