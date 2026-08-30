@@ -1,0 +1,234 @@
+// Command bench drives the benchmark rig.
+//
+// It runs on rig-load: wrk2 executes locally, while proxy-side counters are
+// collected from rig-proxy over SSH. Keeping the load generator and the proxy
+// on separate hosts is a requirement, not a convenience (spec §4.1).
+package main
+
+import (
+	"bytes"
+	"flag"
+	"fmt"
+	"log"
+	"os"
+	"os/exec"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/NotYaniV/RailGun/bench/internal/agg"
+	"github.com/NotYaniV/RailGun/bench/internal/perf"
+	"github.com/NotYaniV/RailGun/bench/internal/proc"
+	"github.com/NotYaniV/RailGun/bench/internal/report"
+	"github.com/NotYaniV/RailGun/bench/internal/result"
+	"github.com/NotYaniV/RailGun/bench/internal/workload"
+	"github.com/NotYaniV/RailGun/bench/internal/wrk"
+)
+
+func main() {
+	if len(os.Args) < 2 {
+		fmt.Fprintln(os.Stderr, "usage: bench <run|report> [flags]")
+		os.Exit(2)
+	}
+	switch os.Args[1] {
+	case "run":
+		cmdRun(os.Args[2:])
+	case "report":
+		cmdReport(os.Args[2:])
+	default:
+		fmt.Fprintf(os.Stderr, "unknown subcommand %q\n", os.Args[1])
+		os.Exit(2)
+	}
+}
+
+func cmdRun(argv []string) {
+	fs := flag.NewFlagSet("run", flag.ExitOnError)
+	proxyHost := fs.String("proxy-host", "", "ssh target for rig-proxy (required)")
+	proxyURL := fs.String("proxy-url", "", "URL of the proxy under test, e.g. http://10.0.0.5:8080 (required)")
+	nullURL := fs.String("null-url", "", "URL of the origin with no proxy in path, for the noise floor (required)")
+	arm := fs.String("arm", "nginx", "name of the non-null arm: nginx or railgun")
+	procName := fs.String("proc-name", "nginx", "process name whose workers are sampled on rig-proxy")
+	repeats := fs.Int("repeats", 5, "repeats per (arm, workload)")
+	outDir := fs.String("out", "bench/results", "directory for run records")
+	fs.Parse(argv)
+
+	if *proxyHost == "" || *proxyURL == "" || *nullURL == "" {
+		fs.Usage()
+		os.Exit(2)
+	}
+	if *repeats < 5 {
+		log.Printf("WARNING: repeats=%d is below the 5 the spec requires; "+
+			"results will be marked UNDERPOWERED", *repeats)
+	}
+
+	var wls []string
+	for _, w := range workload.All() {
+		wls = append(wls, w.Name)
+	}
+
+	for _, st := range runOrder([]string{"null", *arm}, wls, *repeats) {
+		w, _ := workload.ByName(st.Workload)
+		target := *proxyURL
+		if st.Arm == "null" {
+			target = *nullURL
+		}
+		log.Printf("running arm=%s workload=%s repeat=%d", st.Arm, st.Workload, st.Repeat)
+
+		rec, err := runOne(st, w, target, *proxyHost, *procName)
+		if err != nil {
+			log.Fatalf("run failed (arm=%s workload=%s repeat=%d): %v",
+				st.Arm, st.Workload, st.Repeat, err)
+		}
+		path, err := result.Write(*outDir, rec)
+		if err != nil {
+			log.Fatalf("writing result: %v", err)
+		}
+		log.Printf("  -> %s  rps=%.0f p99.9=%v", path, rec.RPS, rec.EndToEnd.P999)
+	}
+}
+
+func runOne(st step, w workload.Workload, target, proxyHost, procName string) (result.Run, error) {
+	var rec result.Run
+
+	// Proxy-side sampling is skipped for the null arm: there is no proxy in the
+	// path, so there are no workers to sample and no counters to attribute.
+	var before []float64
+	var pids []int
+	if st.Arm != "null" {
+		var err error
+		if pids, err = remotePIDs(proxyHost, procName); err != nil {
+			return rec, fmt.Errorf("resolving %s pids: %w", procName, err)
+		}
+		if before, err = remoteSample(proxyHost, pids); err != nil {
+			return rec, fmt.Errorf("sampling before: %w", err)
+		}
+	}
+
+	argv := w.WrkArgs(target)
+	env := append(os.Environ(),
+		"RAILGUN_HEAVY_PATH="+w.Paths[0],
+		"RAILGUN_LIGHT_PATH="+w.Paths[len(w.Paths)-1],
+		"RAILGUN_HEAVY_THREADS="+strconv.Itoa(heavyThreads(w)),
+	)
+	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd.Env = env
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return rec, fmt.Errorf("wrk2: %w", err)
+	}
+
+	out, err := wrk.Parse(bytes.NewReader(stdout.Bytes()))
+	if err != nil {
+		return rec, fmt.Errorf("parsing wrk2 output: %w", err)
+	}
+
+	rec = result.Run{
+		Schema:    result.Schema,
+		RunID:     fmt.Sprintf("%s-%s-%s-%d", time.Now().UTC().Format("20060102-150405"), st.Arm, st.Workload, st.Repeat),
+		Timestamp: time.Now().UTC(),
+		Arm:       st.Arm,
+		Workload:  st.Workload,
+		Repeat:    st.Repeat,
+		RPS:       out.RPS,
+		Requests:  out.Requests,
+		EndToEnd:  out.Latency,
+		WrkArgv:   argv,
+		Counters:  map[string]float64{},
+	}
+
+	if st.Arm != "null" {
+		after, err := remoteSample(proxyHost, pids)
+		if err != nil {
+			return rec, fmt.Errorf("sampling after: %w", err)
+		}
+		rec.PerWorker = make([]float64, len(after))
+		for i := range after {
+			rec.PerWorker[i] = after[i] - before[i]
+			rec.CPUSeconds += rec.PerWorker[i]
+		}
+		rec.Notes = fmt.Sprintf("cpu_skew=%.3f", proc.CPUSkew(rec.PerWorker))
+	}
+	return rec, nil
+}
+
+// heavyThreads converts a workload's HeavyRatio into a whole number of wrk2
+// threads. wrk2 assigns connections to threads, and heaviness must be sticky
+// per connection for the H1 mechanism to exist at all (spec §5.1.1) — so the
+// unit of assignment is the thread, not the request. At least one thread is
+// heavy whenever the ratio is non-zero.
+func heavyThreads(w workload.Workload) int {
+	if w.HeavyRatio <= 0 {
+		return 0
+	}
+	n := int(float64(w.Threads)*w.HeavyRatio + 0.5)
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
+func remotePIDs(host, name string) ([]int, error) {
+	out, err := exec.Command("ssh", host, "pgrep -x "+name).Output()
+	if err != nil {
+		return nil, err
+	}
+	var pids []int
+	for _, line := range strings.Fields(string(out)) {
+		pid, err := strconv.Atoi(line)
+		if err != nil {
+			continue
+		}
+		pids = append(pids, pid)
+	}
+	if len(pids) == 0 {
+		return nil, fmt.Errorf("no processes named %q on %s", name, host)
+	}
+	return pids, nil
+}
+
+// remoteSample reads /proc/<pid>/stat for each pid over one SSH invocation.
+// Records are separated by a sentinel because a stat line contains no newline
+// and the comm field can contain almost anything.
+func remoteSample(host string, pids []int) ([]float64, error) {
+	var b strings.Builder
+	for _, pid := range pids {
+		fmt.Fprintf(&b, "cat /proc/%d/stat; echo; echo '---'; ", pid)
+	}
+	out, err := exec.Command("ssh", host, b.String()).Output()
+	if err != nil {
+		return nil, err
+	}
+	var samples []float64
+	for _, chunk := range strings.Split(string(out), "---") {
+		chunk = strings.TrimSpace(chunk)
+		if chunk == "" {
+			continue
+		}
+		u, s, err := proc.ParseStat([]byte(chunk))
+		if err != nil {
+			return nil, err
+		}
+		samples = append(samples, float64(u+s)/100.0) // USER_HZ
+	}
+	if len(samples) != len(pids) {
+		return nil, fmt.Errorf("sampled %d processes, expected %d", len(samples), len(pids))
+	}
+	return samples, nil
+}
+
+func cmdReport(argv []string) {
+	fs := flag.NewFlagSet("report", flag.ExitOnError)
+	inDir := fs.String("in", "bench/results", "directory of run records")
+	fs.Parse(argv)
+
+	runs, err := result.LoadDir(*inDir)
+	if err != nil {
+		log.Fatalf("loading results: %v", err)
+	}
+	if err := report.Render(os.Stdout, agg.Summarize(runs)); err != nil {
+		log.Fatalf("rendering report: %v", err)
+	}
+	_ = perf.Events // counters are wired in when perf collection lands on the rig
+}
