@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -52,9 +53,14 @@ func cmdRun(argv []string) {
 	repeats := fs.Int("repeats", 5, "repeats per (arm, workload)")
 	outDir := fs.String("out", "bench/results", "directory for run records")
 	scriptDir := fs.String("wrk-script-dir", "bench/wrk", "directory holding the wrk2 Lua scripts")
+	remoteCmd := fs.String("remote-cmd", "ssh {host}",
+		"how to run a shell command on rig-proxy; use `docker exec {host} sh -c` for a containerised dry run")
+	duration := fs.Duration("duration", 0, "override each workload's duration (0 = use the workload's own); short values are for dry runs, not results")
+	only := fs.String("workloads", "", "comma-separated workload names to run (default: all)")
 	fs.Parse(argv)
 
-	if *proxyHost == "" || *proxyURL == "" || *nullURL == "" {
+	// proxyHost may be empty for a single-host dry run; the URLs may not.
+	if *proxyURL == "" || *nullURL == "" {
 		fs.Usage()
 		os.Exit(2)
 	}
@@ -77,18 +83,31 @@ func cmdRun(argv []string) {
 
 	var wls []string
 	for _, w := range workload.All() {
+		if *only != "" && !slices.Contains(strings.Split(*only, ","), w.Name) {
+			continue
+		}
 		wls = append(wls, w.Name)
+	}
+	if len(wls) == 0 {
+		log.Fatalf("no workloads selected by --workloads=%q", *only)
+	}
+	if *duration > 0 {
+		log.Printf("WARNING: --duration=%v overrides the workload durations. "+
+			"Short runs are for validating the harness, not for producing results.", *duration)
 	}
 
 	for _, st := range runOrder([]string{"null", *arm}, wls, *repeats) {
 		w, _ := workload.ByName(st.Workload)
+		if *duration > 0 {
+			w.Duration = *duration
+		}
 		target := *proxyURL
 		if st.Arm == "null" {
 			target = *nullURL
 		}
 		log.Printf("running arm=%s workload=%s repeat=%d", st.Arm, st.Workload, st.Repeat)
 
-		rec, err := runOne(st, w, target, *proxyHost, *procName, *scriptDir)
+		rec, err := runOne(st, w, target, newRemote(*remoteCmd, *proxyHost), *procName, *scriptDir)
 		if err != nil {
 			log.Fatalf("run failed (arm=%s workload=%s repeat=%d): %v",
 				st.Arm, st.Workload, st.Repeat, err)
@@ -101,7 +120,7 @@ func cmdRun(argv []string) {
 	}
 }
 
-func runOne(st step, w workload.Workload, target, proxyHost, procName, scriptDir string) (result.Run, error) {
+func runOne(st step, w workload.Workload, target string, rem remote, procName, scriptDir string) (result.Run, error) {
 	var rec result.Run
 
 	// Proxy-side sampling is skipped for the null arm: there is no proxy in the
@@ -110,10 +129,10 @@ func runOne(st step, w workload.Workload, target, proxyHost, procName, scriptDir
 	var pids []int
 	if st.Arm != "null" {
 		var err error
-		if pids, err = remotePIDs(proxyHost, procName); err != nil {
+		if pids, err = remotePIDs(rem, procName); err != nil {
 			return rec, fmt.Errorf("resolving %s pids: %w", procName, err)
 		}
-		if before, err = remoteSample(proxyHost, pids); err != nil {
+		if before, err = remoteSample(rem, pids); err != nil {
 			return rec, fmt.Errorf("sampling before: %w", err)
 		}
 	}
@@ -153,7 +172,7 @@ func runOne(st step, w workload.Workload, target, proxyHost, procName, scriptDir
 	}
 
 	if st.Arm != "null" {
-		after, err := remoteSample(proxyHost, pids)
+		after, err := remoteSample(rem, pids)
 		if err != nil {
 			return rec, fmt.Errorf("sampling after: %w", err)
 		}
@@ -197,8 +216,9 @@ func heavyThreads(w workload.Workload) int {
 	return n
 }
 
-func remotePIDs(host, name string) ([]int, error) {
-	out, err := exec.Command("ssh", host, "pgrep -x "+name).Output()
+func remotePIDs(rem remote, name string) ([]int, error) {
+	a := rem.argv("pgrep -x " + name)
+	out, err := exec.Command(a[0], a[1:]...).Output()
 	if err != nil {
 		return nil, err
 	}
@@ -211,7 +231,7 @@ func remotePIDs(host, name string) ([]int, error) {
 		pids = append(pids, pid)
 	}
 	if len(pids) == 0 {
-		return nil, fmt.Errorf("no processes named %q on %s", name, host)
+		return nil, fmt.Errorf("no processes named %q on the proxy host", name)
 	}
 	return pids, nil
 }
@@ -219,12 +239,13 @@ func remotePIDs(host, name string) ([]int, error) {
 // remoteSample reads /proc/<pid>/stat for each pid over one SSH invocation.
 // Records are separated by a sentinel because a stat line contains no newline
 // and the comm field can contain almost anything.
-func remoteSample(host string, pids []int) ([]float64, error) {
+func remoteSample(rem remote, pids []int) ([]float64, error) {
 	var b strings.Builder
 	for _, pid := range pids {
 		fmt.Fprintf(&b, "cat /proc/%d/stat; echo; echo '---'; ", pid)
 	}
-	out, err := exec.Command("ssh", host, b.String()).Output()
+	a := rem.argv(b.String())
+	out, err := exec.Command(a[0], a[1:]...).Output()
 	if err != nil {
 		return nil, err
 	}
