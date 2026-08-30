@@ -41,7 +41,21 @@ if [[ "$role" == "proxy" ]]; then
     sudo apt-get install -y nginx
     sudo cp "$(dirname "$0")/nginx/nginx.conf" /etc/nginx/nginx.conf
     sudo nginx -t
-    echo "Now build and start the origin server: make origin && ./bin/origin -addr 127.0.0.1:9001"
+    cat <<'NEXT'
+
+Next, start the origin server:
+
+    make origin && ./bin/origin -addr 0.0.0.0:9001
+
+It must bind 0.0.0.0, not 127.0.0.1. NGINX reaches it over loopback, but the
+null arm (--null-url) is driven from rig-load and needs it reachable across the
+network; a loopback-only origin makes every null run fail and the report then
+refuses to render for want of a noise floor.
+
+SECURITY: 0.0.0.0 exposes the origin to anything that can route to this host.
+Restrict port 9001 to rig-load's address in the instance security group. Do not
+run this rig on a host with a public ingress rule for 9001.
+NEXT
 else
     # wrk2 is not packaged; it must be built from source.
     if ! command -v wrk2 >/dev/null; then

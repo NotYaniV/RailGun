@@ -4,6 +4,7 @@
 package workload
 
 import (
+	"path/filepath"
 	"strconv"
 	"time"
 )
@@ -91,8 +92,10 @@ func ByName(name string) (Workload, bool) {
 }
 
 // WrkArgs renders the full argv, including argv[0], for this workload against
-// targetURL. Callers record the result verbatim in the run record.
-func (w Workload) WrkArgs(targetURL string) []string {
+// targetURL. scriptDir locates the Lua scripts; it is explicit rather than a
+// relative literal so the runner works from any working directory.
+// Callers record the result verbatim in the run record.
+func (w Workload) WrkArgs(targetURL, scriptDir string) []string {
 	args := []string{
 		"wrk2",
 		"-t", strconv.Itoa(w.Threads),
@@ -104,10 +107,10 @@ func (w Workload) WrkArgs(targetURL string) []string {
 	if !w.Keepalive {
 		args = append(args, "-H", "Connection: close")
 	}
+	script := "mixed.lua"
 	if len(w.Paths) == 1 {
-		args = append(args, "--script", "bench/wrk/single.lua")
-	} else {
-		args = append(args, "--script", "bench/wrk/mixed.lua")
+		script = "single.lua"
 	}
+	args = append(args, "--script", filepath.Join(scriptDir, script))
 	return append(args, targetURL)
 }

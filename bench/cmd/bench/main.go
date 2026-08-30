@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"strconv"
@@ -50,6 +51,7 @@ func cmdRun(argv []string) {
 	procName := fs.String("proc-name", "nginx", "process name whose workers are sampled on rig-proxy")
 	repeats := fs.Int("repeats", 5, "repeats per (arm, workload)")
 	outDir := fs.String("out", "bench/results", "directory for run records")
+	scriptDir := fs.String("wrk-script-dir", "bench/wrk", "directory holding the wrk2 Lua scripts")
 	fs.Parse(argv)
 
 	if *proxyHost == "" || *proxyURL == "" || *nullURL == "" {
@@ -59,6 +61,18 @@ func cmdRun(argv []string) {
 	if *repeats < 5 {
 		log.Printf("WARNING: repeats=%d is below the 5 the spec requires; "+
 			"results will be marked UNDERPOWERED", *repeats)
+	}
+
+	// Preflight both targets. A full session is tens of minutes of rig time, and
+	// the null arm in particular fails silently in a way that only shows up at
+	// report time: if the origin is bound to loopback on rig-proxy it is
+	// unreachable from here, every null run dies, and the report then refuses to
+	// render for want of a noise floor. Two seconds here saves the session.
+	for name, u := range map[string]string{"proxy-url": *proxyURL, "null-url": *nullURL} {
+		if err := preflight(u); err != nil {
+			log.Fatalf("%s is not reachable: %v\n"+
+				"  the origin must bind 0.0.0.0 (not 127.0.0.1) for --null-url to work from this host", name, err)
+		}
 	}
 
 	var wls []string
@@ -74,7 +88,7 @@ func cmdRun(argv []string) {
 		}
 		log.Printf("running arm=%s workload=%s repeat=%d", st.Arm, st.Workload, st.Repeat)
 
-		rec, err := runOne(st, w, target, *proxyHost, *procName)
+		rec, err := runOne(st, w, target, *proxyHost, *procName, *scriptDir)
 		if err != nil {
 			log.Fatalf("run failed (arm=%s workload=%s repeat=%d): %v",
 				st.Arm, st.Workload, st.Repeat, err)
@@ -87,7 +101,7 @@ func cmdRun(argv []string) {
 	}
 }
 
-func runOne(st step, w workload.Workload, target, proxyHost, procName string) (result.Run, error) {
+func runOne(st step, w workload.Workload, target, proxyHost, procName, scriptDir string) (result.Run, error) {
 	var rec result.Run
 
 	// Proxy-side sampling is skipped for the null arm: there is no proxy in the
@@ -104,7 +118,7 @@ func runOne(st step, w workload.Workload, target, proxyHost, procName string) (r
 		}
 	}
 
-	argv := w.WrkArgs(target)
+	argv := w.WrkArgs(target, scriptDir)
 	env := append(os.Environ(),
 		"RAILGUN_HEAVY_PATH="+w.Paths[0],
 		"RAILGUN_LIGHT_PATH="+w.Paths[len(w.Paths)-1],
@@ -158,6 +172,20 @@ func runOne(st step, w workload.Workload, target, proxyHost, procName string) (r
 // per connection for the H1 mechanism to exist at all (spec §5.1.1) — so the
 // unit of assignment is the thread, not the request. At least one thread is
 // heavy whenever the ratio is non-zero.
+// preflight confirms a target answers HTTP before a long run commits to it.
+func preflight(rawURL string) error {
+	c := &http.Client{Timeout: 5 * time.Second}
+	resp, err := c.Get(strings.TrimRight(rawURL, "/") + "/bytes/16")
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("GET /bytes/16 returned %s", resp.Status)
+	}
+	return nil
+}
+
 func heavyThreads(w workload.Workload) int {
 	if w.HeavyRatio <= 0 {
 		return 0

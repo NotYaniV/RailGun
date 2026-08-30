@@ -34,6 +34,12 @@ make build
 optional: every result is reported as a delta over that noise floor, and the
 report refuses to render without it.
 
+For that to work the origin must bind `0.0.0.0:9001`, not `127.0.0.1:9001` —
+NGINX reaches it over loopback, but the null arm is driven from rig-load and
+needs it reachable across the network. Restrict port 9001 to rig-load in the
+security group. The runner preflights both URLs before starting, so a
+misconfiguration fails in seconds rather than after a full session.
+
 ## Reading a result
 
 A verdict of `below-noise-floor` or `below-run-variance` means the rig could not

@@ -42,7 +42,7 @@ func TestW2ConnectionCountStaysLow(t *testing.T) {
 
 func TestWrkArgsUsesFixedRate(t *testing.T) {
 	w, _ := ByName("W1")
-	args := w.WrkArgs("http://10.0.0.5:8080")
+	args := w.WrkArgs("http://10.0.0.5:8080", "/opt/railgun/wrk")
 	joined := strings.Join(args, " ")
 
 	if args[0] != "wrk2" {
@@ -56,6 +56,16 @@ func TestWrkArgsUsesFixedRate(t *testing.T) {
 	}
 	if !strings.HasSuffix(joined, "http://10.0.0.5:8080") {
 		t.Errorf("argv must end with the target URL, got %q", joined)
+	}
+}
+
+// The runner may be invoked from any directory, so the script path must come
+// from scriptDir rather than a relative literal.
+func TestWrkArgsHonoursScriptDir(t *testing.T) {
+	w, _ := ByName("W2")
+	joined := strings.Join(w.WrkArgs("http://x", "/opt/railgun/wrk"), " ")
+	if !strings.Contains(joined, "/opt/railgun/wrk/mixed.lua") {
+		t.Errorf("argv must use scriptDir for the Lua script, got %q", joined)
 	}
 }
 
