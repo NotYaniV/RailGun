@@ -5,7 +5,12 @@
 # is to execute the harness end to end — real wrk2, the real nginx.conf with
 # epoll, the real Lua scripts, real /proc sampling — so that defects are found
 # here instead of during a paid two-VM session.
-FROM golang:1.25-bookworm
+# Pinned to amd64 even on an ARM host. wrk2 bundles a LuaJIT from ~2016 that
+# predates ARM64 support and fails with "No support for this architecture
+# (yet)"; wrk2 has been unmaintained since 2019, so this will not be fixed
+# upstream. Emulation is slow, which costs nothing here: a dry run's numbers are
+# meaningless by construction and only the machinery is under test.
+FROM --platform=linux/amd64 golang:1.25-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         nginx \

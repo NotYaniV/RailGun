@@ -57,6 +57,16 @@ Restrict port 9001 to rig-load's address in the instance security group. Do not
 run this rig on a host with a public ingress rule for 9001.
 NEXT
 else
+    # wrk2 bundles a LuaJIT from ~2016 with no ARM64 support, and has been
+    # unmaintained since 2019. rig-load must therefore be x86_64. Checked before
+    # anything is installed so this fails in seconds rather than mid-build.
+    if [[ "$(uname -m)" != "x86_64" ]]; then
+        echo "ERROR: rig-load must be x86_64; this host is $(uname -m)." >&2
+        echo "       wrk2's bundled LuaJIT has no ARM64 support and cannot build here." >&2
+        echo "       Provision an x86_64 instance, or replace the load generator." >&2
+        exit 1
+    fi
+
     # wrk2 is not packaged; it must be built from source.
     if ! command -v wrk2 >/dev/null; then
         sudo apt-get install -y libssl-dev zlib1g-dev

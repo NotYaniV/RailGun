@@ -21,6 +21,14 @@ brew install colima docker && colima start    # lightweight, CLI only
 brew install --cask orbstack                  # faster, includes a GUI
 ```
 
+The image is pinned to `linux/amd64` and runs under emulation on Apple Silicon.
+That is deliberate: wrk2 bundles a LuaJIT from ~2016 with no ARM64 support and
+has been unmaintained since 2019, so it cannot build on ARM. Emulation is slow,
+which costs nothing here — the numbers are meaningless anyway.
+
+**This constrains the real rig too:** rig-load must be x86_64. `setup-host.sh`
+refuses to run on ARM rather than failing partway through a build.
+
 ## Running
 
 ```bash
