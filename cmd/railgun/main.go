@@ -32,6 +32,7 @@ func main() {
 		instrument  = flag.Bool("instrument", true, "record latency histograms")
 		sampleRate  = flag.Uint("sample-rate", 16, "record 1 in N requests when instrumentation is on")
 		reapEvery   = flag.Duration("reap-interval", 10*time.Second, "idle upstream connection sweep interval")
+		splicePipes = flag.Int("splice-probe-pipes", 0, "expected concurrent large-body relays to probe the splice pipe budget against, 0 means the upstream pool's idle cap")
 		drainWindow = flag.Duration("drain", 5*time.Second, "shutdown drain window")
 	)
 	flag.Parse()
@@ -92,6 +93,38 @@ func main() {
 	log.Printf("railgun: addr=%s listeners=%d gomaxprocs=%d gogc=%d memlimit=%s instrument=%v sample=1/%d force-copy=%v splice-threshold=%d",
 		*addr, len(lns), runtime.GOMAXPROCS(0), *gogc, orNone(*memLimit), *instrument, *sampleRate, *forceCopy, opts.SpliceThreshold)
 
+	// Probe splice before serving, and report what the kernel actually granted
+	// rather than what Go asked for.
+	//
+	// This exists because the failure it detects is silent. Go allocates a
+	// 1 MiB pipe per splice; Linux caps total pipe pages per user via
+	// fs.pipe-user-pages-soft, default 64 MiB. Past roughly 63 concurrent
+	// large-body relays the kernel starts handing back single-page pipes, Go's
+	// F_SETPIPE_SZ resize fails, and internal/poll discards the error. Splice
+	// keeps working at a fraction of the intended buffer and nothing anywhere
+	// says so. Measured on Linux 6.8 with stock sysctls the cliff is exactly
+	// the 64th concurrent relay.
+	//
+	// The probe holds every pipe open simultaneously, which is the only way to
+	// see a limit on total pages held. Probing one pipe at a time would report
+	// a clean bill of health on a host that degrades at the tenth relay.
+	//
+	// The count probed is the expected concurrent large-body relay count, not
+	// a constant, because the answer depends entirely on that number.
+	probePipes := *splicePipes
+	if probePipes <= 0 {
+		probePipes = opts.PoolConfig.MaxIdle
+	}
+	spliceProbe = sysx.ProbeSplice(probePipes)
+	probe := spliceProbe
+	log.Printf("railgun: splice: %s", probe.String())
+	if probe.Degraded() {
+		log.Printf("railgun: warning: the kernel downsized splice pipes under %d concurrent relays; raise fs.pipe-user-pages-soft (bench/RUNBOOK.md section 5) before taking any W4 measurement. Do NOT grant the process CAP_SYS_RESOURCE to make this go away: it exempts the process from resource accounting generally and does not match how the proxy would be deployed.", probePipes)
+	}
+	if !probe.Available {
+		log.Printf("railgun: warning: splice is unavailable (%s); response bodies will move through userspace and no W4 number from this host is valid", probe.Reason)
+	}
+
 	if *adminAddr != "" {
 		go serveAdmin(*adminAddr, srv)
 	}
@@ -146,6 +179,17 @@ func main() {
 	log.Print("railgun: stopped")
 }
 
+// spliceProbe is the startup probe result, kept so the metrics scrape can
+// report it into the result set.
+var spliceProbe sysx.SpliceProbe
+
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
 func orNone(s string) string {
 	if s == "" {
 		return "unset"
@@ -176,6 +220,16 @@ func serveAdmin(addr string, srv *proxy.Server) {
 			fmt.Fprintf(w, "railgun_pool_overflowed{upstream=%q} %d\n", a, st.Overflowed)
 		}
 		fmt.Fprintf(w, "railgun_upstream_conns_in_use %d\n", srv.UpstreamConnsInUse())
+		// The splice probe goes into the scrape as well as the log, so it
+		// lands in the result set rather than only in a terminal someone has
+		// since closed.
+		fmt.Fprintf(w, "railgun_splice_available %d\n", boolInt(spliceProbe.Available))
+		fmt.Fprintf(w, "railgun_splice_degraded %d\n", boolInt(spliceProbe.Degraded()))
+		fmt.Fprintf(w, "railgun_splice_pipes_probed %d\n", spliceProbe.PipesProbed)
+		fmt.Fprintf(w, "railgun_splice_pipes_at_full %d\n", spliceProbe.PipesAtFull)
+		fmt.Fprintf(w, "railgun_splice_pipe_bytes_first %d\n", spliceProbe.FirstSize)
+		fmt.Fprintf(w, "railgun_splice_pipe_bytes_smallest %d\n", spliceProbe.SmallestSize)
+		fmt.Fprintf(w, "railgun_splice_pipe_bytes_wanted %d\n", spliceProbe.WantPipeSize)
 	})
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Printf("railgun: admin: %v", err)

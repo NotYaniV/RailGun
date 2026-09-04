@@ -227,9 +227,9 @@ generally, and it also would not match how the proxy is expected to be deployed.
 go test ./internal/sysx -run SpliceReport -v      # prints the table above for this host
 ```
 
-Railgun also prints the one-line probe at startup, so a degraded rig announces
-itself before the run rather than in the numbers afterwards. A `DEGRADED` line
-invalidates the splice arm.
+`SpliceProbe.String()` is built to be one startup log line, so that once it is
+wired into `cmd/railgun` a degraded rig announces itself before the run rather
+than in the numbers afterwards. A `DEGRADED` line invalidates the splice arm.
 
 Then confirm it empirically under load:
 
