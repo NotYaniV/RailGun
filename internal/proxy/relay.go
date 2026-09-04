@@ -280,6 +280,23 @@ func (s *Server) pickMember(up *config.Upstream) (string, *upstream.Pool, error)
 	if len(up.Addrs) == 0 {
 		return "", nil, errors.New("proxy: upstream has no members")
 	}
+	if len(up.Addrs) == 1 {
+		// Single-member upstream: there is nothing to choose between, so the
+		// health check below decides nothing and is pure cost.
+		//
+		// It is not free cost. RetryAt takes the pool's mutex, so the loop
+		// underneath was acquiring that lock once per request on top of the
+		// Acquire and Release that actually do work. A mutex profile of the
+		// running proxy put RetryAt at very nearly the same contention delay
+		// as Acquire itself — a third of the pool's entire share, spent on a
+		// question with one possible answer.
+		//
+		// Acquire still returns ErrUpstreamDown while the pool is in backoff,
+		// so the down state is not being ignored here, only consulted once
+		// instead of twice.
+		addr := up.Addrs[0]
+		return addr, s.pool(addr), nil
+	}
 	now := s.clock.Now()
 	for _, addr := range up.Addrs {
 		p := s.pool(addr)
