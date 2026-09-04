@@ -80,6 +80,13 @@ type connState struct {
 	// hadBody records whether the request carried a body, sampled before the
 	// buffer is compacted.
 	hadBody bool
+
+	// forceCloseDown makes the response announce Connection: close regardless
+	// of what either peer asked for. Closing the connection without saying so
+	// in the head is not enough: the client is entitled to send another request
+	// on a connection it was told would stay open, and it then loses whatever
+	// it sent into a socket the proxy is already tearing down.
+	forceCloseDown bool
 }
 
 // method returns the saved request method.
@@ -118,6 +125,40 @@ func (st *connState) reset() {
 	st.wroteResponse = false
 	st.methodLen = 0
 	st.hadBody = false
+	st.forceCloseDown = false
+}
+
+// clientError marks a relay failure caused by the DOWNSTREAM client rather than
+// by the upstream.
+//
+// The distinction is not cosmetic here, it is benchmark integrity. roundTrip
+// attributed every error out of forward to the upstream, so a client that
+// truncated its own request body was counted as ErrBadGateway and answered 502.
+// Upstream error rate is a headline number in the comparison against NGINX, and
+// a client-caused error booked as an upstream failure is exactly the kind of
+// thing that gets noticed in a writeup rather than in a test.
+//
+// Only unambiguous client faults are wrapped. A failure inside io.Copy between
+// the two sockets could be either side and is left attributed to the upstream,
+// which is the conservative reading — it over-reports our own error rate rather
+// than under-reporting it, and erring toward making our own numbers look worse
+// is the only safe direction for a project whose output is a comparison.
+type clientError struct{ err error }
+
+func (e *clientError) Error() string { return "proxy: client: " + e.err.Error() }
+func (e *clientError) Unwrap() error { return e.err }
+
+func clientFault(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &clientError{err: err}
+}
+
+// isClientFault reports whether err was attributed to the downstream client.
+func isClientFault(err error) bool {
+	var ce *clientError
+	return errors.As(err, &ce)
 }
 
 // exchange drives one request/response pair and reports whether the downstream
@@ -274,6 +315,16 @@ func (s *Server) roundTrip(down *net.TCPConn, st *connState, up *config.Upstream
 				st.un = 0
 				continue
 			}
+			if isClientFault(err) {
+				// The client broke its own request. Answering 502 would blame
+				// the origin, and counting it as an upstream error would put a
+				// client fault into the number this project publishes.
+				if !st.wroteResponse {
+					s.writeError(down, 400)
+				}
+				metrics.IncError(metrics.ErrOther)
+				return false, err
+			}
 			if !st.wroteResponse {
 				s.writeError(down, 502)
 			}
@@ -350,12 +401,66 @@ func (s *Server) forward(down, up *net.TCPConn, st *connState) (keepAlive, upReu
 	}
 
 	if st.req.HasBody() {
+		if st.req.Expect100 {
+			// A client sending Expect: 100-continue is entitled to withhold its
+			// body until it sees an interim response, so blocking on that body
+			// first deadlocks the exchange: the client waits for 100, the proxy
+			// waits for bytes the client is not yet allowed to send, and the
+			// only thing that resolves it is a timeout. httpx has always parsed
+			// Expect100; nothing read it.
+			final, err := s.relayExpectInterim(down, up, st)
+			if err != nil {
+				return false, false, err
+			}
+			if final {
+				// The origin answered with a final status instead of 100 — 417,
+				// or an auth rejection that costs nothing to make before the
+				// body arrives. Forwarding the body now would be pointless, and
+				// the client may still send it, so those bytes would land in the
+				// read buffer and be parsed as the next request. Relay the
+				// response, and tell the client the connection is ending so
+				// it does not send that body into a socket being torn down.
+				st.forceCloseDown = true
+				return s.relayResponse(down, up, st)
+			}
+		}
 		if err := s.forwardRequestBody(down, up, st); err != nil {
 			return false, false, err
 		}
 	}
 
 	return s.relayResponse(down, up, st)
+}
+
+// relayExpectInterim waits for the origin's verdict on an Expect: 100-continue
+// request and forwards an interim response downstream, so the client learns it
+// may send its body.
+//
+// final reports that the origin replied with a final status rather than an
+// interim one. In that case the response head is deliberately left in the
+// upstream buffer for relayResponse to parse, rather than being handled twice.
+//
+// Known limitation: this waits on the origin, bounded only by UpstreamTimeout.
+// RFC 9110 requires a server receiving Expect: 100-continue to answer with
+// either an interim or a final status, so a conforming origin always replies —
+// but an origin that ignores Expect and simply waits for the body stalls until
+// that timeout. Bounding the wait separately and sending the body anyway is the
+// fix if a real origin ever behaves that way.
+func (s *Server) relayExpectInterim(down, up *net.TCPConn, st *connState) (final bool, err error) {
+	if err := s.readResponseHead(up, st); err != nil {
+		return false, err
+	}
+	if !st.resp.Informational() {
+		return true, nil
+	}
+
+	st.respOut = st.respOut[:0]
+	st.respOut = httpx.AppendTunnelResponseHead(st.respOut, &st.resp)
+	if _, err := s.writeDown(down, st.respOut, st); err != nil {
+		return false, err
+	}
+	st.consumeUp(st.resp.HeadLen)
+	return false, nil
 }
 
 // forwardRequestBody moves the request body upstream.
@@ -372,7 +477,8 @@ func (s *Server) forwardRequestBody(down, up *net.TCPConn, st *connState) error 
 		for {
 			n, done, err := st.cs.Scan(st.buf[head:st.n])
 			if err != nil {
-				return err
+				// Malformed chunked framing from the client.
+				return clientFault(err)
 			}
 			if n > 0 {
 				if _, err := up.Write(st.buf[head : head+n]); err != nil {
@@ -394,7 +500,8 @@ func (s *Server) forwardRequestBody(down, up *net.TCPConn, st *connState) error 
 			st.n = 0
 			head = 0
 			if err := st.fillDown(down); err != nil {
-				return err
+				// The client stopped sending its own body.
+				return clientFault(err)
 			}
 		}
 	}
@@ -416,8 +523,22 @@ func (s *Server) forwardRequestBody(down, up *net.TCPConn, st *connState) error 
 	if remaining > 0 {
 		// A request body large enough to matter goes kernel-to-kernel. The
 		// LimitedReader is unwrapped by net.spliceFrom, so this still splices.
-		if _, err := io.Copy(up, io.LimitReader(down, remaining)); err != nil {
+		//
+		// The byte count is checked, and that is not defensive padding. io.Copy
+		// over a LimitReader returns a NIL error when the source hits EOF early:
+		// it moved everything there was, which is not everything that was
+		// promised. Treating that as success sends the origin a head declaring
+		// a body it will never finish receiving, and the proxy then waits for a
+		// response that cannot come until UpstreamTimeout — one packet from a
+		// client pinning an upstream connection and a slab slot for the whole
+		// window, and the slab is fixed size.
+		n, err := io.Copy(up, io.LimitReader(down, remaining))
+		if err != nil {
 			return err
+		}
+		if n < remaining {
+			// The client promised more body than it sent.
+			return clientFault(io.ErrUnexpectedEOF)
 		}
 	}
 	return nil
@@ -458,7 +579,7 @@ func (s *Server) relayResponse(down, up *net.TCPConn, st *connState) (keepAlive,
 		}
 
 		closeUp := st.resp.Close || framing == httpx.BodyUntilClose
-		closeDown := st.req.Close || st.resp.Close
+		closeDown := st.req.Close || st.resp.Close || st.forceCloseDown
 
 		st.respOut = st.respOut[:0]
 		st.respOut = httpx.AppendResponseHead(st.respOut, &st.resp, closeDown)
@@ -565,8 +686,27 @@ func (s *Server) relayLengthBody(down, up *net.TCPConn, st *connState, length in
 	}
 
 	if !s.opts.ForceCopy && remaining >= s.opts.SpliceThreshold {
-		_, err := io.Copy(down, io.LimitReader(up, remaining))
-		return err
+		// Short copy is a failure, not a success. The copy arm below already
+		// treats an early EOF as io.ErrUnexpectedEOF; this arm did not, so the
+		// two arms of experiment E2 disagreed about correctness rather than
+		// only about speed.
+		//
+		// What the missing check allows: an origin that dies mid-response sends
+		// fewer bytes than its Content-Length promised, io.Copy reports nil, the
+		// exchange looks successful, and the client keeps a connection whose
+		// framing it and the proxy no longer agree on — it is still waiting for
+		// the rest of a body, so the NEXT response it reads is consumed as body
+		// bytes. Returning an error instead makes relayResponse report the
+		// connection unreusable in both directions, which is what forces the
+		// client to resynchronise by reconnecting.
+		n, err := io.Copy(down, io.LimitReader(up, remaining))
+		if err != nil {
+			return err
+		}
+		if n < remaining {
+			return io.ErrUnexpectedEOF
+		}
+		return nil
 	}
 
 	for remaining > 0 {
@@ -655,6 +795,7 @@ func (s *Server) tunnel(down, up *net.TCPConn, st *connState) error {
 // it saves on the rare one.
 func (s *Server) readRequestHead(down *net.TCPConn, st *connState) error {
 	st.wroteResponse = false
+	st.forceCloseDown = false
 	idleArmed, headArmed := false, false
 	for {
 		if st.n > 0 {
