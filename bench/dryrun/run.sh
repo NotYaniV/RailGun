@@ -12,7 +12,7 @@ REPEATS="${REPEATS:-2}"
 OUT="${OUT:-/tmp/dryrun-results}"
 
 echo "=== nginx config check (this is where 'use epoll' would fail on a non-Linux host) ==="
-cp /src/bench/nginx/nginx.conf /etc/nginx/nginx.conf
+sh /src/bench/nginx/render.sh > /etc/nginx/nginx.conf
 nginx -t
 
 echo "=== starting origin on 0.0.0.0:9001 ==="
