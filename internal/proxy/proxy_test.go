@@ -70,7 +70,7 @@ func newRig(t *testing.T, opts proxy.Options, h http.Handler) *rig {
 // the proxy to the framing rules a real client enforces.
 func (r *rig) client() *http.Client {
 	return &http.Client{
-		Timeout: 10 * time.Second,
+		Timeout: 30 * time.Second,
 		Transport: &http.Transport{
 			MaxIdleConnsPerHost: 4,
 			DisableCompression:  true,
@@ -97,12 +97,20 @@ func (r *rig) get(c *http.Client, path string) (*http.Response, []byte) {
 	return resp, body
 }
 
+// testOpts returns generous timeouts on purpose.
+//
+// No test here asserts on a timeout value; the one that tests idle expiry sets
+// its own. Everything else only needs the timeouts to be longer than a healthy
+// exchange takes. Tight values make the suite fail when the machine is busy —
+// running a benchmark in another terminal is enough — and a test that fails
+// under load teaches nothing except to rerun it, which is how a real failure
+// gets waved through later.
 func testOpts() proxy.Options {
 	o := proxy.DefaultOptions()
-	o.IdleTimeout = 2 * time.Second
-	o.ReadTimeout = 2 * time.Second
-	o.WriteTimeout = 2 * time.Second
-	o.UpstreamTimeout = 5 * time.Second
+	o.IdleTimeout = 30 * time.Second
+	o.ReadTimeout = 15 * time.Second
+	o.WriteTimeout = 15 * time.Second
+	o.UpstreamTimeout = 20 * time.Second
 	o.MaxUpstreamConns = 256
 	return o
 }

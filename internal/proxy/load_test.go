@@ -31,18 +31,40 @@ func TestSustainedLoad(t *testing.T) {
 
 	goroutinesBefore := runtime.NumGoroutine()
 
+	// slack covers connections still winding down and the runtime's own
+	// housekeeping goroutines. It is deliberately small: a per-request leak
+	// across 4800 requests is not a handful of goroutines, it is thousands,
+	// so a tight bound is not needed to catch one and a loose bound would not
+	// miss it.
+	const slack = 16
+
 	const workers = 32
 	const perWorker = 150
 
 	var ok, failed atomic.Int64
 	var wg sync.WaitGroup
+
+	// Clients are built up front and kept, so their idle connections can be
+	// closed before the goroutine count is read. Without that step the check
+	// below counts the proxy's serve goroutines for connections the CLIENT is
+	// still holding open in its keepalive pool, and reports working keepalive
+	// as a leak. Under light load each worker keeps one connection and the
+	// wrong assertion passes; under load the client opens up to
+	// MaxIdleConnsPerHost per worker and it fails. That is the worst kind of
+	// test — one that only fails when the machine is busy, teaching the reader
+	// to rerun rather than to look.
+	clients := make([]*http.Client, workers)
+	for i := range clients {
+		clients[i] = r.client()
+	}
+
 	start := time.Now()
 
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			c := r.client()
+			c := clients[id]
 			// Mix body sizes so both sides of the splice threshold are
 			// exercised, and mix in a chunked response so the scanner has to
 			// resynchronize the connection repeatedly rather than once.
@@ -100,21 +122,41 @@ func TestSustainedLoad(t *testing.T) {
 		t.Errorf("%d dials for %d requests; the pool is barely reusing anything", dials, total)
 	}
 
+	// Close every client's idle connections, so the only downstream serve
+	// goroutines left are ones the proxy failed to release. This is what turns
+	// the check below from "is keepalive working" into "did anything leak".
+	for _, c := range clients {
+		c.Transport.(*http.Transport).CloseIdleConnections()
+	}
+
+	// The upstream side is retained deliberately and must be accounted for
+	// rather than closed. Every connection sitting in the pool is a connection
+	// the ORIGIN is also holding, and in this test the origin is an
+	// http.Server in the same process, so each one costs a goroutine here that
+	// would live in a different process on a real rig. Pooling them is the
+	// whole point of the pool; counting them as a leak would mean the test
+	// passes only when the feature under test is broken.
+	var idle int
+	for _, st := range r.srv.PoolStats() {
+		idle += st.Idle
+	}
+
 	// Goroutines need a moment to unwind after the last response.
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	var after int
 	for time.Now().Before(deadline) {
 		runtime.GC()
 		after = runtime.NumGoroutine()
-		if after <= goroutinesBefore+workers {
+		if after <= goroutinesBefore+idle+slack {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	if after > goroutinesBefore+workers {
-		t.Errorf("goroutines went from %d to %d across %d requests; suspect a leak",
-			goroutinesBefore, after, total)
+	if after > goroutinesBefore+idle+slack {
+		t.Errorf("goroutines went from %d to %d across %d requests; %d pooled upstream connections and %d slack are accounted for, so this is a leak",
+			goroutinesBefore, after, total, idle, slack)
 	}
+	t.Logf("goroutines %d -> %d with %d pooled upstream connections retained", goroutinesBefore, after, idle)
 }
 
 // BenchmarkProxyThroughput exists to be run under a profiler, not to produce a
