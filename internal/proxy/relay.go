@@ -154,6 +154,13 @@ func (s *Server) exchange(down *net.TCPConn, st *connState) (bool, error) {
 	metrics.IncRequest()
 
 	// The head is in; bound the remainder of the exchange as a whole.
+	//
+	// Known limitation, stated rather than solved: this bound is a constant
+	// and takes no account of how many body bytes were promised. A large W4
+	// response to a genuinely slow client is held to the same deadline as a
+	// 1 KiB one. That is fine on the rig, where the load generator is never
+	// the slow party, and it would need a byte-rate policy rather than a
+	// bigger constant before this faced a real client population.
 	if d := s.opts.ReadTimeout + s.opts.WriteTimeout; d > 0 {
 		_ = down.SetDeadline(s.clock.Now().Add(d))
 	}
@@ -206,6 +213,20 @@ func (s *Server) roundTrip(down *net.TCPConn, st *connState, up *config.Upstream
 	// the request meant, leaving the origin no room to conclude otherwise.
 	st.reqOut = st.reqOut[:0]
 	st.reqOut = httpx.AppendRequestHead(st.reqOut, &st.req, false)
+
+	// Drop the head from the read buffer ONCE, here, not once per attempt
+	// inside forward. What sits behind the head is a pipelined request, so
+	// compacting again on a retry would discard its first HeadLen bytes and
+	// the parser would resynchronise partway into a client-controlled message.
+	// The retry replays the request; it must not replay the compaction.
+	//
+	// Safe at this point because reqOut is already serialized: every field of
+	// st.req still read after this — HasBody, Close, HeadLen — is a scalar, and
+	// the method, the one aliasing field still needed, was copied out by
+	// saveMethod.
+	if !st.req.HasBody() {
+		st.compactAfterHead()
+	}
 
 	for attempt := 0; ; attempt++ {
 		tok, reused, err := pool.Acquire()
@@ -332,8 +353,6 @@ func (s *Server) forward(down, up *net.TCPConn, st *connState) (keepAlive, upReu
 		if err := s.forwardRequestBody(down, up, st); err != nil {
 			return false, false, err
 		}
-	} else {
-		st.compactAfterHead()
 	}
 
 	return s.relayResponse(down, up, st)
@@ -555,8 +574,19 @@ func (s *Server) relayLengthBody(down, up *net.TCPConn, st *connState, length in
 			remaining -= int64(n)
 		}
 		if err != nil {
-			if err == io.EOF && remaining > 0 {
-				return io.ErrUnexpectedEOF
+			if err == io.EOF {
+				// A Read may return (n > 0, io.EOF) together. If those bytes
+				// completed the body, the exchange succeeded and returning EOF
+				// here would have the caller tear down a connection that is
+				// fine. *net.TCPConn happens never to do this — it reports EOF
+				// on a separate zero-byte read — so this is a latent trap
+				// rather than a live bug, and it is closed now because the
+				// day this parameter becomes an io.Reader is not the day to
+				// rediscover it.
+				if remaining > 0 {
+					return io.ErrUnexpectedEOF
+				}
+				return nil
 			}
 			return err
 		}
@@ -616,7 +646,7 @@ func (s *Server) tunnel(down, up *net.TCPConn, st *connState) error {
 // it saves on the rare one.
 func (s *Server) readRequestHead(down *net.TCPConn, st *connState) error {
 	st.wroteResponse = false
-	first := true
+	idleArmed, headArmed := false, false
 	for {
 		if st.n > 0 {
 			if _, err := st.req.Parse(st.buf[:st.n]); err == nil {
@@ -630,19 +660,34 @@ func (s *Server) readRequestHead(down *net.TCPConn, st *connState) error {
 				return httpx.ErrHeadTooLarge
 			}
 		}
-		// The first read of an exchange is the keepalive wait and gets the
-		// longer idle timeout; once bytes have arrived, the shorter read
-		// timeout bounds a client that stalls mid-head.
-		if first && st.n == 0 {
-			// The first read of an exchange is the keepalive wait and gets the
-			// idle timeout. Once any byte has arrived the deadline tightens to
-			// the read timeout, which is what bounds a client that opens a
-			// connection and then stalls partway through a header block.
-			_ = down.SetDeadline(s.clock.Now().Add(s.opts.IdleTimeout))
-		} else if first {
-			_ = down.SetDeadline(s.clock.Now().Add(s.opts.ReadTimeout))
+		// While no byte of a request has arrived this is the keepalive wait and
+		// it gets the idle timeout. The moment any byte arrives the deadline
+		// tightens to the read timeout, which is what bounds a client that
+		// opens a connection and then stalls partway through a header block.
+		//
+		// The tightening has to be driven by st.n rather than by "is this the
+		// first read", because the stall being bounded happens on the SECOND
+		// read and later. Arming only on the first pass left a client that
+		// sends one byte holding the connection for the whole idle timeout —
+		// typically the keepalive window, so orders of magnitude longer than
+		// intended, at the cost of one byte.
+		//
+		// Each is armed once. Re-arming per read would pay for a deadline reset
+		// on every segment of a dribbled head and would also let a client that
+		// keeps sending bytes slowly extend the bound indefinitely.
+		if st.n == 0 {
+			if !idleArmed {
+				if d := s.opts.IdleTimeout; d > 0 {
+					_ = down.SetDeadline(s.clock.Now().Add(d))
+				}
+				idleArmed = true
+			}
+		} else if !headArmed {
+			if d := s.opts.ReadTimeout; d > 0 {
+				_ = down.SetDeadline(s.clock.Now().Add(d))
+			}
+			headArmed = true
 		}
-		first = false
 		if err := st.fillDown(down); err != nil {
 			return err
 		}

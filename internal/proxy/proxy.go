@@ -123,9 +123,14 @@ type Server struct {
 	mu    sync.Mutex
 	pools map[string]*upstream.Pool
 
-	closing atomic.Bool
-	conns   sync.WaitGroup
-	done    chan struct{}
+	// closing stops new accepts and new keepalive rounds. Either StopAccepting
+	// or Shutdown may set it, so it cannot also serve as Shutdown's
+	// once-only guard — shutdownOnce does that. Conflating the two made
+	// Shutdown a no-op whenever the documented drain order was followed.
+	closing      atomic.Bool
+	shutdownOnce atomic.Bool
+	conns        sync.WaitGroup
+	done         chan struct{}
 }
 
 // New builds a Server over an existing config store.
@@ -281,8 +286,15 @@ func (s *Server) ServeConn(c *net.TCPConn) {
 // connection is accepted, but a reuseport listener close can discard SYNs the
 // kernel has already queued, so the caller is expected to have removed this
 // instance from the group and waited a drain interval before getting here.
+// Shutdown is safe to call after StopAccepting, and the drain order documented
+// on StopAccepting requires exactly that. It therefore guards itself with its
+// own flag rather than with closing: closing is already true by the time the
+// caller gets here, so a CompareAndSwap on it would return early and skip the
+// drain, the pool close and the done signal — turning graceful shutdown into
+// an immediate exit while still logging that it drained.
 func (s *Server) Shutdown(ctx <-chan struct{}) {
-	if !s.closing.CompareAndSwap(false, true) {
+	s.closing.Store(true)
+	if !s.shutdownOnce.CompareAndSwap(false, true) {
 		return
 	}
 	drained := make(chan struct{})
