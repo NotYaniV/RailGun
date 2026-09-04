@@ -384,6 +384,13 @@ func (s *Server) forwardRequestBody(down, up *net.TCPConn, st *connState) error 
 				st.consume(head + n)
 				return nil
 			}
+			// Discarding the buffer here is correct only because of
+			// ChunkScanner's contract: when done is false it has consumed the
+			// WHOLE slice, so n == len(p) and every byte has already been
+			// forwarded. If it ever returned a short count with done false,
+			// this would silently drop body bytes. Stated here because the
+			// contract lives in another package and a reviewer had to go read
+			// it to convince themselves this was not a bug.
 			st.n = 0
 			head = 0
 			if err := st.fillDown(down); err != nil {
@@ -497,6 +504,8 @@ func (s *Server) relayBody(down, up *net.TCPConn, st *connState, framing httpx.B
 				st.consumeUp(n)
 				return nil
 			}
+			// Same reliance on ChunkScanner's all-or-nothing contract as
+			// forwardRequestBody; see the note there.
 			st.un = 0
 			if err := st.fillUp(up); err != nil {
 				return err
