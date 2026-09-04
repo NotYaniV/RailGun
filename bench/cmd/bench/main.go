@@ -23,6 +23,7 @@ import (
 	"github.com/NotYaniV/RailGun/bench/internal/proc"
 	"github.com/NotYaniV/RailGun/bench/internal/report"
 	"github.com/NotYaniV/RailGun/bench/internal/result"
+	"github.com/NotYaniV/RailGun/bench/internal/spliceguard"
 	"github.com/NotYaniV/RailGun/bench/internal/workload"
 	"github.com/NotYaniV/RailGun/bench/internal/wrk"
 )
@@ -57,6 +58,16 @@ func cmdRun(argv []string) {
 		"how to run a shell command on rig-proxy; use `docker exec {host} sh -c` for a containerised dry run")
 	duration := fs.Duration("duration", 0, "override each workload's duration (0 = use the workload's own); short values are for dry runs, not results")
 	only := fs.String("workloads", "", "comma-separated workload names to run (default: all)")
+	forceCopy := fs.Bool("force-copy", false,
+		"this run is Railgun's -force-copy control arm (spec §5.5 E2): the body is routed through a "+
+			"pooled userspace buffer instead of splice, so zero splice syscalls is the correct outcome "+
+			"and the W4 splice guard is skipped rather than applied")
+	spliceMaxCalls := fs.Float64("w4-splice-max-calls-per-request", spliceguard.DefaultMaxCallsPerRequest,
+		"W4 guard: fail the run if splice() calls per large-body request rises above this "+
+			"(see spliceguard.DefaultMaxCallsPerRequest for the reasoning)")
+	spliceMinBytesFrac := fs.Float64("w4-splice-min-bytes-fraction", spliceguard.DefaultMinBytesPerSpliceFraction,
+		"W4 guard: fail the run if average bytes moved per splice() call falls below this fraction "+
+			"of the body size (see spliceguard.DefaultMinBytesPerSpliceFraction for the reasoning)")
 	fs.Parse(argv)
 
 	// proxyHost may be empty for a single-host dry run; the URLs may not.
@@ -107,7 +118,8 @@ func cmdRun(argv []string) {
 		}
 		log.Printf("running arm=%s workload=%s repeat=%d", st.Arm, st.Workload, st.Repeat)
 
-		rec, err := runOne(st, w, target, newRemote(*remoteCmd, *proxyHost), *procName, *scriptDir)
+		rec, err := runOne(st, w, target, newRemote(*remoteCmd, *proxyHost), *procName, *scriptDir,
+			*forceCopy, spliceguard.Tolerances{MaxCallsPerRequest: *spliceMaxCalls, MinBytesPerSpliceFraction: *spliceMinBytesFrac})
 		if err != nil {
 			log.Fatalf("run failed (arm=%s workload=%s repeat=%d): %v",
 				st.Arm, st.Workload, st.Repeat, err)
@@ -120,7 +132,8 @@ func cmdRun(argv []string) {
 	}
 }
 
-func runOne(st step, w workload.Workload, target string, rem remote, procName, scriptDir string) (result.Run, error) {
+func runOne(st step, w workload.Workload, target string, rem remote, procName, scriptDir string,
+	forceCopy bool, spliceTol spliceguard.Tolerances) (result.Run, error) {
 	var rec result.Run
 
 	// Proxy-side sampling is skipped for the null arm: there is no proxy in the
@@ -182,8 +195,45 @@ func runOne(st step, w workload.Workload, target string, rem remote, procName, s
 			rec.CPUSeconds += rec.PerWorker[i]
 		}
 		rec.Notes = fmt.Sprintf("cpu_skew=%.3f", proc.CPUSkew(rec.PerWorker))
+		if forceCopy {
+			rec.Notes += "; force_copy=true"
+		}
+	}
+
+	// W4 splice guard (spec §5.5): a non-zero splice count is not enough — the
+	// kernel can silently shrink the relay pipe (fs.pipe-user-pages-soft) and
+	// splice keeps "working" at a fraction of its intended throughput. Only
+	// checked once the splice counter has actually been collected (perf
+	// collection lands separately; a missing key, per perf.Parse's own
+	// convention, means "not measured" rather than "measured zero") and only
+	// on the splice-enabled arm — -force-copy is the control arm, where zero
+	// splices is the correct outcome.
+	if st.Workload == "W4" {
+		if spliceCount, ok := rec.Counters["syscalls:sys_enter_splice"]; ok {
+			bodyBytes, err := w4BodyBytes(w)
+			if err != nil {
+				return rec, err
+			}
+			if err := spliceguard.Check(spliceCount, rec.Requests, bodyBytes, forceCopy, spliceTol); err != nil {
+				return rec, err
+			}
+		}
 	}
 	return rec, nil
+}
+
+// w4BodyBytes recovers the response body size W4 requests from its origin
+// path (e.g. "/bytes/1048576"), so the splice guard can check observed
+// syscalls against the size the workload actually asked for rather than a
+// second hard-coded constant.
+func w4BodyBytes(w workload.Workload) (int64, error) {
+	p := w.Paths[len(w.Paths)-1]
+	i := strings.LastIndex(p, "/")
+	n, err := strconv.ParseInt(p[i+1:], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("workload %s: path %q does not encode a body size", w.Name, p)
+	}
+	return n, nil
 }
 
 // heavyThreads converts a workload's HeavyRatio into a whole number of wrk2
