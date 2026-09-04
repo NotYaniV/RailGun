@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "upstreams": [
+    {"name": "app", "addrs": ["127.0.0.1:9001"]}
+  ],
+  "routes": [
+    {"host": "app.test", "upstream": "app"}
+  ]
+}
