@@ -39,7 +39,11 @@ sudo sysctl -w net.ipv4.tcp_tw_reuse=1
 
 if [[ "$role" == "proxy" ]]; then
     sudo apt-get install -y nginx
-    sudo cp "$(dirname "$0")/nginx/nginx.conf" /etc/nginx/nginx.conf
+    # NGINX_WORKERS must match the core set the proxy is pinned to, which is the
+    # same set Railgun gets (spec §4.3, bench/RUNBOOK.md §4). Unset means nproc,
+    # which is right only on an unpinned host.
+    "$(dirname "$0")/nginx/render.sh" ${NGINX_WORKERS:+"$NGINX_WORKERS"} \
+        | sudo tee /etc/nginx/nginx.conf >/dev/null
     sudo nginx -t
     cat <<'NEXT'
 
