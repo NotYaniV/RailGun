@@ -4,6 +4,8 @@
 
 # benchmark results are large and machine-specific; publish curated ones only
 /bench/results/
+# E1 profiles and timings (make e1); the findings live in internal/upstream/E1.md
+/bench-out/
 *.perf
 perf.data*
 

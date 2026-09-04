@@ -190,14 +190,48 @@ Two limits refuse it:
   It fits by zero margin, so any image or distro that lowers it breaks splice
   sizing silently. Assert the value; do not assume the default.
 - `fs.pipe-user-pages-soft` — default 16384 pages (64 MiB) of pipe buffer **per
-  user**. Past it the kernel allocates new pipes at a single page (`pipe_bufs =
-  1` in `alloc_pipe_info`) for unprivileged users, and `F_SETPIPE_SZ` back up to
-  1 MiB then fails too. At 1 MiB per in-flight splice, ~64 concurrent large-body
-  relays cross it — squarely inside W4's operating range. `0` disables the
-  limit.
+  user**. Past it the kernel allocates new pipes at a single page
+  (`pipe_bufs = 1` in `alloc_pipe_info`) for processes without
+  `CAP_SYS_RESOURCE`, and `F_SETPIPE_SZ` back up to 1 MiB then fails too.
+  `0` disables the limit.
 
-§1 removes both ceilings. Verify the effect empirically rather than trusting the
-sysctl:
+### This is measured, not inferred
+
+`internal/sysx.ProbeSplice` holds N pipes open at once and reports what the
+kernel granted each one. On Linux 6.8.0 (aarch64), stock `fs.pipe-user-pages-soft`:
+
+| Pipes held | Result |
+|---|---|
+| 1 | `available pipe=1024KiB (1/1 at 1024KiB)` |
+| 8 | `available pipe=1024KiB (8/8 at 1024KiB)` |
+| **64** | `DEGRADED smallest=64KiB (63/64 at 1024KiB)` |
+| 128 | `DEGRADED smallest=8KiB (63/128 at 1024KiB)` |
+
+**The cliff is the 64th concurrent large-body relay**, exactly where the
+arithmetic puts it: 16384 pages × 4 KiB = 64 MiB, at 1 MiB per pipe = 63 pipes
+before the 64th is refused. W4 operates straight through that point.
+
+Setting `fs.pipe-user-pages-soft=0` and re-running the same unprivileged probe
+gives `128/128 at 1024KiB`; restoring 16384 brings the cliff back. So the §1
+setting is verified to fix it, not merely believed to.
+
+One tempting non-fix: `CAP_SYS_RESOURCE` also exempts a process from the soft
+limit — a privileged container shows 128/128 with the stock sysctl. Do not take
+that route. Raising a sysctl on a dedicated benchmark host is a smaller change
+than granting the proxy a capability that lets it bypass resource accounting
+generally, and it also would not match how the proxy is expected to be deployed.
+
+### Verifying on the rig
+
+```sh
+go test ./internal/sysx -run SpliceReport -v      # prints the table above for this host
+```
+
+Railgun also prints the one-line probe at startup, so a degraded rig announces
+itself before the run rather than in the numbers afterwards. A `DEGRADED` line
+invalidates the splice arm.
+
+Then confirm it empirically under load:
 
 ```sh
 # During a W4 run: splice count must be proportional to large-body requests
