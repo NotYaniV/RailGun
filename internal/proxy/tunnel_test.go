@@ -232,3 +232,71 @@ func TestTunnelLargeConcurrentTransfer(t *testing.T) {
 		}
 	}
 }
+
+// The tunnel teardown closes the upstream socket directly while the pool still
+// holds its token, and roundTrip then discards that token, which closes it
+// again. That is safe, but "safe" here rests on two separate invariants and it
+// is worth pinning them rather than believing them: a second Close on a
+// *net.TCPConn only errors, and slab.remove Swaps the slot to nil so the free
+// list is appended to exactly once however many times it is called.
+//
+// A double free is what would actually hurt — the same slot handed to two
+// connections at once, so one of them relays onto the other's socket.
+// inUse() is len(slots)-len(free), so a double free drives it negative, which
+// is the signature this watches for.
+func TestTunnelTeardownDoesNotCorruptTheSlab(t *testing.T) {
+	origin := newUpgradeOrigin(t, func(c net.Conn) {
+		io.WriteString(c, "x")
+		c.Close()
+	})
+	r := newRigTo(t, testOpts(), origin.Addr().String())
+
+	for i := range 5 {
+		c, err := net.Dial("tcp", r.addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.SetDeadline(time.Now().Add(5 * time.Second))
+		if _, err := io.WriteString(c, upgradeReq); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.Copy(io.Discard, c); err != nil {
+			t.Fatalf("tunnel %d: draining: %v", i, err)
+		}
+		c.Close()
+
+		deadline := time.Now().Add(3 * time.Second)
+		for {
+			n := r.srv.UpstreamConnsInUse()
+			if n < 0 {
+				t.Fatalf("tunnel %d: slab in-use went negative (%d) — a token was "+
+					"freed twice and two connections can now share a slot", i, n)
+			}
+			if n == 0 {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("tunnel %d: %d upstream connections still held", i, n)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+
+	// The slab must still hand out working slots after all that.
+	c, err := net.Dial("tcp", r.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.WriteString(c, upgradeReq); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 16)
+	if _, err := c.Read(buf); err != nil {
+		t.Fatalf("upgrade after five tunnels failed: %v", err)
+	}
+	if !strings.HasPrefix(string(buf), "HTTP/1.1 101") {
+		t.Fatalf("got %q, want a 101", buf)
+	}
+}

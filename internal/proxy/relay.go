@@ -283,6 +283,17 @@ func (s *Server) roundTrip(down *net.TCPConn, st *connState, up *config.Upstream
 		}
 
 		uc := s.slab.get(tok)
+		if uc != nil && reused && s.opts.VerifyPooledConns && pooledConnIsDirty(uc) {
+			// Experiment E3: the connection is closed or carries bytes no
+			// request asked for. Either way its framing is not something this
+			// proxy and the origin still agree on, so it must not be used.
+			s.dirtyPooled.Add(1)
+			pool.Discard(tok)
+			if attempt == 0 {
+				continue
+			}
+			uc = nil
+		}
 		if uc == nil {
 			// The token outlived its connection. Treat it as a dead pooled
 			// entry rather than trusting it.
@@ -590,6 +601,41 @@ func (s *Server) relayResponse(down, up *net.TCPConn, st *connState) (keepAlive,
 
 		if err := s.relayBody(down, up, st, framing, length); err != nil {
 			return false, false, err
+		}
+
+		// Anything still sitting in the upstream buffer is a byte the response
+		// framing did not account for, and it must not outlive this exchange.
+		//
+		// The buffer belongs to the DOWNSTREAM connection's state, not to the
+		// upstream connection the bytes arrived on. Returning that upstream to
+		// the pool while leaving them here means the next exchange on this
+		// client connection parses them as its own response — after acquiring
+		// what may be an entirely different upstream — and answers the client
+		// with something no origin sent for that request.
+		//
+		// So the bytes are dropped and the upstream is not reused. Both halves
+		// are needed: dropping alone would leave a connection whose framing the
+		// proxy and the origin no longer agree on sitting in the pool.
+		//
+		// The boundary of this check, stated because it is easy to read as
+		// stronger than it is: it catches overrun bytes that had ARRIVED by the
+		// time the exchange ended, which is every case where the origin wrote
+		// them in the same segment as the response it was asked for. Bytes
+		// still in flight at that moment land in the socket buffer of a
+		// connection already returned to the pool, and the next exchange to
+		// acquire it reads them as its own response.
+		//
+		// Closing that remainder needs the proxy to know whether an idle pooled
+		// connection has become readable. Go's own http.Transport does it by
+		// keeping a read loop running on every idle connection, which is a
+		// goroutine per pooled connection and precisely the cost Approach A
+		// exists to avoid. It is free under Approach B: a multishot read on an
+		// idle connection is how the ring already works, so M3 can close this
+		// where M1 cannot. Until then it is a known limitation against a
+		// non-conforming origin, not a defended boundary.
+		if st.un > 0 {
+			st.un = 0
+			closeUp = true
 		}
 		return !closeDown, !closeUp, nil
 	}
