@@ -5,6 +5,9 @@ package sysx
 import (
 	"errors"
 	"net"
+	"runtime"
+	"strconv"
+	"sync/atomic"
 
 	"golang.org/x/sys/unix"
 	"testing"
@@ -191,5 +194,87 @@ func TestCloseAfterDrainUnblocksAcceptLoop(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("accept loop never unblocked after shutdown")
+	}
+}
+
+// TestListenDistributesAcrossTheGroup pins the premise of spec §5.1: the kernel
+// spreads accepts across the reuseport group by 4-tuple hash, which is what
+// replaces NGINX's accept_mutex question rather than answering it.
+//
+// If the group silently collapsed to a single listener — a Control function
+// that failed quietly, a kernel without SO_REUSEPORT load balancing — every
+// benchmark number would still look entirely plausible and the architecture
+// being measured would not be the one described.
+func TestListenDistributesAcrossTheGroup(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		// SO_REUSEPORT on the BSDs and darwin permits multiple binds but does
+		// not load balance across them; FreeBSD needs SO_REUSEPORT_LB for that
+		// and darwin has no equivalent. So a development run on a Mac has one
+		// effective listener however many were opened, and the distribution
+		// this asserts can only be checked on the platform the rig runs.
+		t.Skip("SO_REUSEPORT load balancing is Linux-only; darwin delivers to one socket")
+	}
+
+	const listeners = 4
+	const dials = 200
+
+	lns, err := Listen("127.0.0.1:0", listeners)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeAll(lns)
+	addr := lns[0].Addr().String()
+
+	counts := make([]atomic.Int64, listeners)
+	for i, l := range lns {
+		go func(i int, l *net.TCPListener) {
+			for {
+				c, err := l.Accept()
+				if err != nil {
+					return
+				}
+				counts[i].Add(1)
+				c.Close()
+			}
+		}(i, l)
+	}
+
+	for range dials {
+		c, err := net.DialTimeout("tcp", addr, 2*time.Second)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		c.Close()
+	}
+
+	// Accepts are asynchronous; wait for the count to settle rather than
+	// sleeping a guessed interval.
+	deadline := time.Now().Add(5 * time.Second)
+	var total int64
+	for time.Now().Before(deadline) {
+		total = 0
+		for i := range counts {
+			total += counts[i].Load()
+		}
+		if total >= dials {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	used, detail := 0, ""
+	for i := range counts {
+		n := counts[i].Load()
+		if n > 0 {
+			used++
+		}
+		detail += " " + strconv.Itoa(i) + "=" + strconv.FormatInt(n, 10)
+	}
+	t.Logf("accepted %d of %d dials across %d listeners:%s", total, dials, used, detail)
+
+	if used < 2 {
+		t.Fatalf("every one of %d connections landed on a single listener (%s); "+
+			"the reuseport group is not distributing and spec §5.1's premise "+
+			"does not hold on this host", dials, detail)
 	}
 }
