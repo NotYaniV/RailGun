@@ -55,6 +55,32 @@ func AppendRequestHead(dst []byte, r *Request, close bool) []byte {
 	} else if r.ContentLength >= 0 {
 		dst = appendContentLength(dst, r.ContentLength)
 	}
+
+	// An upgrade request is the one case where Connection and Upgrade must be
+	// re-emitted rather than dropped.
+	//
+	// Both are hop-by-hop, and stripping them is correct for every ordinary
+	// request: forwarding them is how a client reaches through a proxy and
+	// manipulates the proxy-to-origin connection. But an upgrade is precisely a
+	// request to change the protocol of the next hop, so removing the two
+	// headers that say so leaves the origin an ordinary request. It answers 200
+	// instead of 101 and no upgrade can ever occur — which is not a degraded
+	// upgrade, it is a silently impossible one.
+	//
+	// Request.Upgrade is non-nil only when the parse saw BOTH a protocol in
+	// Upgrade and "upgrade" listed in Connection, so this cannot be triggered
+	// by an Upgrade header alone.
+	if r.Upgrade != nil {
+		dst = append(dst, "Connection: Upgrade\r\nUpgrade: "...)
+		dst = append(dst, r.Upgrade...)
+		dst = append(dst, crlf...)
+		// Two CRLFs, not one: the first terminates the Upgrade field line, the
+		// second is the empty line that ends the head. Every other branch here
+		// appends a field line that already carries its own terminator, so the
+		// single trailing crlf they share is the empty line alone.
+		return append(dst, crlf...)
+	}
+
 	if close {
 		dst = append(dst, connClose...)
 	} else {

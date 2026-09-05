@@ -769,18 +769,47 @@ func (s *Server) tunnel(down, up *net.TCPConn, st *connState) error {
 		st.n = 0
 	}
 
+	// Both directions run concurrently and the FIRST to finish tears down the
+	// tunnel.
+	//
+	// The obvious shape — one direction inline, the other in a goroutine, then
+	// wait for both — deadlocks whenever one peer goes away while the other
+	// stays silent. If the origin closes, the up->down copy returns and the
+	// down->up copy is left blocked reading from a client that has nothing to
+	// say and never closes. Nothing unblocks it: not a deadline, since a tunnel
+	// clears them by design, and not the peer, which is gone. That goroutine,
+	// the serve goroutine above it, the pooled connection state, the slab slot
+	// and the upstream connection are then held for the life of the process,
+	// and since the connection never leaves the WaitGroup, Shutdown blocks to
+	// its deadline however generous that deadline is.
+	//
+	// Closing both sockets on first completion is what unblocks the other copy.
+	// It costs the exotic case of a genuinely half-open tunnel — a peer that
+	// has shut down its write side while still reading — which here means a
+	// peer that stops sending is treated as done. Deliberate: a tunnel whose
+	// origin has hung up has nowhere to forward what the client sends anyway.
 	errc := make(chan error, 2)
 	go func() {
 		_, err := io.Copy(up, down)
 		_ = up.CloseWrite()
 		errc <- err
 	}()
-	_, err := io.Copy(down, up)
-	_ = down.CloseWrite()
-	if err == nil {
-		err = <-errc
-	} else {
-		<-errc
+	go func() {
+		_, err := io.Copy(down, up)
+		_ = down.CloseWrite()
+		errc <- err
+	}()
+
+	err := <-errc
+	_ = down.Close()
+	_ = up.Close()
+	if other := <-errc; err == nil {
+		err = other
+	}
+	// A tunnel ending because a peer closed is the normal outcome, not a
+	// failure. The caller tears both connections down either way.
+	if err == io.EOF {
+		return nil
 	}
 	return err
 }
