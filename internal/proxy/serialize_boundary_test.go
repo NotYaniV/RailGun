@@ -124,7 +124,71 @@ func TestConnectionNamedHeadersAreNotForwarded(t *testing.T) {
 	if !strings.Contains(got, "hdr=X-Kept: yes") {
 		t.Errorf("an ordinary header was dropped\nsaw:\n%s", got)
 	}
-	if strings.Contains(got, "hdr=Connection:") {
-		t.Errorf("Connection itself was forwarded\nsaw:\n%s", got)
+	// The proxy states its OWN Connection value to the origin, which is
+	// correct — that header describes the proxy-to-origin hop. What must not
+	// survive is the client's token list.
+	if strings.Contains(got, "X-Hop-Secret") {
+		t.Errorf("the client's Connection token list survived\nsaw:\n%s", got)
+	}
+}
+
+// The same rule in the other direction, which is where this codebase has
+// repeatedly had one side right and the other wrong: the copy arm checked for a
+// short body and the splice arm did not, request truncation and response
+// truncation were separate bugs. An origin naming a header in its Connection
+// response header is asking for that header to stop at this hop.
+func TestConnectionNamedResponseHeadersAreNotForwarded(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				br := bufio.NewReader(c)
+				for {
+					if _, err := http.ReadRequest(br); err != nil {
+						return
+					}
+					io.WriteString(c, "HTTP/1.1 200 OK\r\n"+
+						"Content-Length: 2\r\n"+
+						"Connection: keep-alive, X-Origin-Hop\r\n"+
+						"X-Origin-Hop: leaked\r\n"+
+						"X-Kept: yes\r\n\r\nok")
+				}
+			}(c)
+		}
+	}()
+
+	r := newRigTo(t, testOpts(), ln.Addr().String())
+
+	c, err := net.Dial("tcp", r.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.WriteString(c, "GET / HTTP/1.1\r\nHost: app.test\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+
+	if v := resp.Header.Get("X-Origin-Hop"); v != "" {
+		t.Errorf("a response header the origin named in Connection reached the "+
+			"client: X-Origin-Hop: %s", v)
+	}
+	if resp.Header.Get("X-Kept") != "yes" {
+		t.Errorf("an ordinary response header was dropped: %v", resp.Header)
 	}
 }
