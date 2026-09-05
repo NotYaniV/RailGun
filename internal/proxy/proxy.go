@@ -64,6 +64,38 @@ type Options struct {
 	// UpstreamTimeout bounds a single upstream operation.
 	UpstreamTimeout time.Duration
 
+	// VerifyPooledConns makes every reuse of a pooled upstream connection
+	// check first that the connection is clean, discarding it if the peer has
+	// closed it or if there are readable bytes no request asked for.
+	//
+	// This is experiment E3, and it is off by default because it is a genuine
+	// trade rather than a free improvement.
+	//
+	// What it buys is the half of the origin-overrun defect that the
+	// end-of-exchange check cannot reach. That check drops leftover bytes that
+	// had already ARRIVED when the exchange ended, which covers every crafted
+	// case and most real ones. It cannot cover bytes still in flight: those
+	// land in the socket buffer of a connection already back in the pool, and
+	// the next acquirer reads them as its own response. Verifying at acquire
+	// time is the other side of that window.
+	//
+	// What it costs is one non-blocking recvmsg per pooled acquire — a syscall
+	// per request, in a project whose entire thesis is spending fewer of them.
+	//
+	// The reason this is an experiment and not a decision is that it may pay
+	// for itself. It also detects the keepalive race, where the origin closed a
+	// pooled connection, and detecting that costs one syscall while discovering
+	// it the current way costs a write, a failed read, a discard and a full
+	// retry. Whether one cheap syscall on every request beats one expensive
+	// retry on a few is arithmetic that depends on the origin's keepalive
+	// behaviour, and the rig can measure it directly by running both arms.
+	//
+	// Go's net/http solves the same problem by keeping a read loop on every
+	// idle connection, which is a goroutine per pooled connection. That is
+	// precisely the cost Approach A exists to avoid, so it is not an option
+	// here.
+	VerifyPooledConns bool
+
 	// ClockInterval is the update period of the cached coarse clock that
 	// feeds timeout arithmetic. See coarseClock for why this exists and what
 	// precision it costs.
@@ -127,6 +159,8 @@ type Server struct {
 	// or Shutdown may set it, so it cannot also serve as Shutdown's
 	// once-only guard — shutdownOnce does that. Conflating the two made
 	// Shutdown a no-op whenever the documented drain order was followed.
+	dirtyPooled atomic.Uint64
+
 	closing      atomic.Bool
 	shutdownOnce atomic.Bool
 	conns        sync.WaitGroup
@@ -350,6 +384,11 @@ func (s *Server) PoolStats() map[string]upstream.Stats {
 
 // UpstreamConnsInUse reports occupied slab slots.
 func (s *Server) UpstreamConnsInUse() int { return s.slab.inUse() }
+
+// DirtyPooledConns reports how many pooled connections were discarded by the
+// VerifyPooledConns check. It is the numerator of experiment E3: if this stays
+// at zero across a run, the syscall bought nothing on that origin.
+func (s *Server) DirtyPooledConns() uint64 { return s.dirtyPooled.Load() }
 
 // serve drives one downstream connection for its whole lifetime.
 //

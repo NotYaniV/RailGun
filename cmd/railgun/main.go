@@ -25,6 +25,7 @@ func main() {
 		cfgPath     = flag.String("config", "", "path to the route config JSON")
 		adminAddr   = flag.String("admin", "127.0.0.1:9090", "admin/metrics listen address, empty to disable")
 		listeners   = flag.Int("listeners", 0, "SO_REUSEPORT listeners, 0 means GOMAXPROCS")
+		verifyPool  = flag.Bool("verify-pooled-conns", false, "check each pooled upstream connection is clean before reuse, at one non-blocking syscall per reuse (experiment E3)")
 		forceCopy   = flag.Bool("force-copy", false, "route response bodies through a userspace buffer, never splice (experiment E2 control arm)")
 		spliceMin   = flag.Int64("splice-threshold", 0, "body size at or above which splice is used, 0 means the built-in default")
 		gogc        = flag.Int("gogc", 400, "GOGC target")
@@ -68,6 +69,7 @@ func main() {
 
 	opts := proxy.DefaultOptions()
 	opts.ForceCopy = *forceCopy
+	opts.VerifyPooledConns = *verifyPool
 	if *spliceMin > 0 {
 		opts.SpliceThreshold = *spliceMin
 	}
@@ -90,8 +92,8 @@ func main() {
 	// set. Spec 5.8 requires a run to report whether instrumentation was on,
 	// because a peak-RPS number taken with it on is not comparable to one
 	// taken with it off.
-	log.Printf("railgun: addr=%s listeners=%d gomaxprocs=%d gogc=%d memlimit=%s instrument=%v sample=1/%d force-copy=%v splice-threshold=%d",
-		*addr, len(lns), runtime.GOMAXPROCS(0), *gogc, orNone(*memLimit), *instrument, *sampleRate, *forceCopy, opts.SpliceThreshold)
+	log.Printf("railgun: addr=%s listeners=%d gomaxprocs=%d gogc=%d memlimit=%s instrument=%v sample=1/%d force-copy=%v splice-threshold=%d verify-pooled-conns=%v",
+		*addr, len(lns), runtime.GOMAXPROCS(0), *gogc, orNone(*memLimit), *instrument, *sampleRate, *forceCopy, opts.SpliceThreshold, *verifyPool)
 
 	// Probe splice before serving, and report what the kernel actually granted
 	// rather than what Go asked for.
@@ -220,6 +222,10 @@ func serveAdmin(addr string, srv *proxy.Server) {
 			fmt.Fprintf(w, "railgun_pool_overflowed{upstream=%q} %d\n", a, st.Overflowed)
 		}
 		fmt.Fprintf(w, "railgun_upstream_conns_in_use %d\n", srv.UpstreamConnsInUse())
+		// E3's numerator: pooled connections discarded because they were closed
+		// or carried bytes no request asked for. Zero across a run means the
+		// syscall bought nothing against that origin.
+		fmt.Fprintf(w, "railgun_pooled_conns_dirty_total %d\n", srv.DirtyPooledConns())
 		// The splice probe goes into the scrape as well as the log, so it
 		// lands in the result set rather than only in a terminal someone has
 		// since closed.
