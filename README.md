@@ -29,6 +29,27 @@ What is NOT done, and what is therefore not yet claimable:
   unproven. It is the project's central claim and it may well be false. The
   falsification condition is stated in advance in the design spec.
 
+### Review status of internal/proxy/relay.go
+
+Stated because "defects found" is easy to read as "defects therefore gone".
+
+The relay has had two review passes. They produced six defects: three reachable
+by a client, two of them capable of desynchronising message framing between the
+proxy and a peer, and one a denial of service that exhausts the upstream
+connection slab from a few hundred one-packet requests. All six are fixed and
+each has a test confirmed to fail without its fix.
+
+Six in one file is a density that predicts more rather than a bill of health. A
+third pass is what the second pass earned, not what it made unnecessary. The
+file is the newest code in the repository and is doing the hardest thing in it:
+holding two connections, a parser, a pool and a buffer in agreement about where
+one message ends and the next begins.
+
+Until that settles, a green benchmark run should not be read as validating this
+file. A proxy can post excellent numbers while silently mis-framing a fraction
+of a percent of exchanges, and the benchmark would not notice — wrk2 sends
+well-formed requests and never truncates one.
+
 ## Layout
 
 ```
