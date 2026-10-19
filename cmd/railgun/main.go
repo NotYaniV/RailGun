@@ -127,6 +127,24 @@ func main() {
 		log.Printf("railgun: warning: splice is unavailable (%s); response bodies will move through userspace and no W4 number from this host is valid", probe.Reason)
 	}
 
+	// SO_REUSEPORT means different things on different kernels, and the
+	// difference silently invalidates local measurements.
+	//
+	// Linux load balances new connections across every socket in the group,
+	// which is the entire basis of spec 5.1's accept path. darwin and the BSDs
+	// permit the multiple binds but do NOT distribute across them — FreeBSD
+	// needs SO_REUSEPORT_LB and darwin has no equivalent — so every listener
+	// after the first sits idle and the proxy runs effectively single-listener.
+	//
+	// Nothing breaks. But "listeners=8" in the line above is true on the rig
+	// and misleading on a laptop, and a local throughput number taken without
+	// knowing this is a single-listener number being read as an eight-listener
+	// one.
+	if runtime.GOOS != "linux" && len(lns) > 1 {
+		log.Printf("railgun: warning: %s does not load balance across a SO_REUSEPORT group, so only one of the %d listeners will receive connections; this build runs effectively single-listener and produces no valid accept-path measurement",
+			runtime.GOOS, len(lns))
+	}
+
 	if *adminAddr != "" {
 		go serveAdmin(*adminAddr, srv)
 	}

@@ -57,11 +57,29 @@ type Snapshot struct {
 // table. All of that work happens here, at construction time — never
 // lazily — so Route needs no lock and can run on the hot path.
 func NewSnapshot(version uint64, routes []Route, upstreams []Upstream) (*Snapshot, error) {
+	// Copy the caller's slices instead of retaining them, so the documented
+	// "a Snapshot is never mutated after publishing" invariant is structural
+	// rather than advisory.
+	//
+	// It is load-bearing. byHost holds pointers INTO s.Upstreams, and a
+	// published Snapshot is read without synchronisation by every in-flight
+	// request on every core. A caller that reused or appended to the slice it
+	// passed in would be mutating live data underneath all of them — a data
+	// race whose symptom is a request routed to the wrong upstream, not a
+	// crash. Load happens to build fresh slices every time, so nothing is
+	// wrong today; that is exactly the kind of safety that quietly stops
+	// holding when a second caller appears.
+	//
+	// The copy is shallow, which is sufficient: Upstream.Addrs is copied
+	// below, and every other field is a value.
 	s := &Snapshot{
 		Version:   version,
-		Routes:    routes,
-		Upstreams: upstreams,
+		Routes:    append([]Route(nil), routes...),
+		Upstreams: append([]Upstream(nil), upstreams...),
 		byHost:    make(map[string]*Upstream, len(routes)),
+	}
+	for i := range s.Upstreams {
+		s.Upstreams[i].Addrs = append([]string(nil), s.Upstreams[i].Addrs...)
 	}
 
 	byName := make(map[string]*Upstream, len(upstreams))

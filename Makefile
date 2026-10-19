@@ -1,10 +1,27 @@
-.PHONY: test build railgun origin bench fmt vet race lint
+.PHONY: test test-linux build railgun origin bench fmt vet race lint
 
 test:
 	go test ./...
 
 race:
 	go test -race ./...
+
+# Run the suite ON Linux, not merely cross-compiled for it.
+#
+# This is not redundant with `go test`. Several paths in this repository do not
+# exist on darwin at all: splice(2) is Linux-only, so the splice arm of the
+# body relay silently falls back to a userspace copy, and SO_REUSEPORT does not
+# load balance on darwin or the BSDs, so a reuseport group behaves as a single
+# listener. A local run therefore executes neither the zero-copy path nor the
+# multi-listener accept path, and reports success for both.
+#
+# TestProxyForceCopyMatchesSplice is the clearest case: on darwin both of its
+# arms take the copy path, so it compares the copy against itself and passes
+# for the wrong reason.
+test-linux:
+	@command -v docker >/dev/null || { echo "test-linux: docker not found; needs a container runtime (colima, OrbStack or Docker Desktop)"; exit 1; }
+	@docker info >/dev/null 2>&1 || { echo "test-linux: docker is installed but the daemon is not responding; start it (e.g. 'colima start') and retry"; exit 1; }
+	docker run --rm -v "$(PWD)":/src -w /src golang:1.25 go test ./...
 
 vet:
 	go vet ./...

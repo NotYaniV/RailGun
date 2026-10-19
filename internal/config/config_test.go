@@ -236,3 +236,41 @@ func TestLoadMissingFile(t *testing.T) {
 		t.Fatal("Load() = nil error, want error for missing file")
 	}
 }
+
+// TestNewSnapshotCopiesItsInputs pins the invariant that a published Snapshot
+// is immutable, as a property of the code rather than of caller discipline.
+//
+// byHost holds pointers into Snapshot.Upstreams, and a published Snapshot is
+// read without synchronisation by every in-flight request on every core. If
+// NewSnapshot retained the caller's slices, a caller that reused or mutated one
+// would be changing live data underneath all of them, and the symptom would be
+// a request routed to the wrong upstream rather than a crash.
+func TestNewSnapshotCopiesItsInputs(t *testing.T) {
+	routes := []Route{{Host: "a.test", Upstream: "one"}}
+	ups := []Upstream{{Name: "one", Addrs: []string{"127.0.0.1:1"}}}
+
+	snap, err := NewSnapshot(1, routes, ups)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Mutate everything the caller still holds a reference to.
+	routes[0].Host = "mutated.test"
+	routes[0].Upstream = "gone"
+	ups[0].Name = "mutated"
+	ups[0].Addrs[0] = "127.0.0.1:9999"
+
+	u, ok := snap.Route([]byte("a.test"))
+	if !ok {
+		t.Fatal("route lookup broke after the caller mutated its own slice")
+	}
+	if u.Name != "one" {
+		t.Errorf("upstream name is %q after caller mutation, want %q", u.Name, "one")
+	}
+	if u.Addrs[0] != "127.0.0.1:1" {
+		t.Errorf("upstream address is %q after caller mutation, want %q", u.Addrs[0], "127.0.0.1:1")
+	}
+	if snap.Routes[0].Host != "a.test" {
+		t.Errorf("snapshot route host is %q after caller mutation", snap.Routes[0].Host)
+	}
+}

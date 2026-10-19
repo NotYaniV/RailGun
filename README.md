@@ -76,6 +76,7 @@ instead of relinking it.
 make build                      # bin/railgun, bin/origin, bin/bench
 make test                       # go test ./...
 make race                       # go test -race ./...
+make test-linux                 # the same suite, executed on Linux in a container
 
 bin/origin -addr 127.0.0.1:9001 &
 bin/railgun -addr :8080 -config examples/routes.json -memlimit 512MiB
@@ -107,6 +108,23 @@ Routing is exact-host, case-insensitive, port-stripped. See
   real: a working set larger than L3 pays for itself in cache misses at exactly
   the request rate the memory was spent to buy. Running without it prints a
   warning and the run is not publishable.
+
+### macOS runs the code but not all of its paths
+
+`make test` on a Mac is not the same suite. Two of the paths this project exists
+to measure do not exist on darwin:
+
+- `splice(2)` is Linux-only, so the zero-copy body relay silently falls back to
+  a userspace copy. `TestProxyForceCopyMatchesSplice` compares the copy path
+  against itself and passes for the wrong reason.
+- `SO_REUSEPORT` permits multiple binds on darwin and the BSDs but does not load
+  balance across them (FreeBSD needs `SO_REUSEPORT_LB`; darwin has no
+  equivalent). A group of N listeners behaves as one, so the accept path in
+  design spec 5.1 is not exercised at all, and the binary warns about this at
+  startup.
+
+`make test-linux` runs the same suite in a container and is the only place those
+paths execute. Both suites pass on Linux 6.8.
 
 ## Requirements
 

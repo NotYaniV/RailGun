@@ -25,6 +25,19 @@ import "bytes"
 // n<=64 with the whole array resident in L1, a linear scan with an ASCII
 // case-insensitive compare beats hashing outright — there is no hash to
 // compute and no pointer chase.
+// Known divergence from the spec, recorded rather than papered over: design
+// spec 5.3 describes this cap as configurable and it is a compile-time const.
+// Making it configurable would mean the header array could no longer be inline
+// in Request and Response, which is the allocation decision this whole package
+// is built around — a runtime-sized array is a heap allocation per message.
+//
+// The practical consequence is that a response carrying more than 64 header
+// lines is rejected with 502 rather than truncated. Rejecting is the right
+// behaviour and is not in question; what is in question is whether an operator
+// facing a chatty origin can raise the limit, and today they can only do it by
+// recompiling. Either the spec should say fixed, or this needs a design that
+// keeps the common case inline and spills, and that is a decision rather than
+// an oversight.
 const MaxHeaders = 64
 
 // Error is a parse failure carrying the status code the proxy should return.

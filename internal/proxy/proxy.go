@@ -210,6 +210,24 @@ func defaultDialer(addr string) (*net.TCPConn, error) {
 // on experiment E1 showing real contention in a -mutex or -block profile,
 // because building it first would reproduce NGINX's known pool fragmentation
 // before proving the contention it is meant to fix exists.
+// ponytail: pools are never pruned. An address removed from the configuration
+// keeps its Pool and its map entry until the process exits, because pools are
+// keyed by address in the Server rather than held by the Snapshot and only
+// Shutdown closes them.
+//
+// This is a slow map leak, not a connection leak: MaxIdleTime still reaps the
+// connections inside a dead pool, so what survives is an empty Pool struct and
+// a map entry. It needs many reloads with genuinely changing backends to
+// matter, and it is invisible in a benchmark.
+//
+// It is also the cost of a deliberate property. Pools outliving the
+// configuration is precisely why a reload here does not drop the upstream
+// keepalive pool the way an NGINX reload does, which
+// TestConfigSwapKeepsTheUpstreamPool pins. Pruning safely needs to know that no
+// in-flight request is still using a pool routed under an older snapshot, which
+// means refcounting pools — real machinery for a bounded leak. Add it if a
+// long-lived proxy with frequently changing backends ever shows the map
+// growing; not before.
 func (s *Server) pool(addr string) *upstream.Pool {
 	s.mu.Lock()
 	p, ok := s.pools[addr]

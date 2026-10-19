@@ -22,10 +22,22 @@ var (
 //
 //   - The version is normalized to HTTP/1.1. The upstream pool only holds
 //     keepalive connections, and HTTP/1.0 has no reliable persistence.
+//
 //   - Hop-by-hop headers are dropped, including every field named in the
 //     request's own Connection header. Forwarding those is how a downstream
 //     client reaches through the proxy and manipulates the proxy-to-origin
 //     connection.
+//
+//     There are TWO Connection headers in play and confusing them is the most
+//     likely misreading of this function — two separate reviewers have each
+//     written a test asserting the wrong one, independently. The CLIENT's
+//     Connection header describes the client-to-proxy hop; it is stripped, as
+//     is every header it names. The Connection header this function EMITS
+//     describes the proxy-to-origin hop, which is a pooled connection whose
+//     disposition is the proxy's decision and nothing to do with what the
+//     client asked for. So the origin always sees a Connection header, and it
+//     is never the client's.
+//
 //   - Framing headers are re-emitted from the parsed semantics rather than
 //     copied. The parse already rejected ambiguous framing, so re-emitting
 //     guarantees the bytes on the upstream connection say exactly what this
