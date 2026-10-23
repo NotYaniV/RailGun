@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("0 * HTTP/1.0\r\nHost:\r\nTrAnsfer-EnCoding:0,Chunked\r\n\r\n")

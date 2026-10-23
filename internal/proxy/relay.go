@@ -590,7 +590,9 @@ func (s *Server) relayResponse(down, up *net.TCPConn, st *connState) (keepAlive,
 		}
 
 		closeUp := st.resp.Close || framing == httpx.BodyUntilClose
-		closeDown := st.req.Close || st.resp.Close || st.forceCloseDown
+		// An until-close body carries no length, so closing the client
+		// connection is the only way the client learns where it ends.
+		closeDown := st.req.Close || st.resp.Close || st.forceCloseDown || framing == httpx.BodyUntilClose
 
 		st.respOut = st.respOut[:0]
 		st.respOut = httpx.AppendResponseHead(st.respOut, &st.resp, closeDown)

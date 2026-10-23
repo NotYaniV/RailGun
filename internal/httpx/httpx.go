@@ -337,16 +337,6 @@ func hasToken(v, tok []byte) bool {
 	return false
 }
 
-// lastToken returns the final element of a comma-separated list, OWS-trimmed.
-// Transfer-Encoding framing is determined by the last coding, not by whether
-// "chunked" appears somewhere in the list.
-func lastToken(v []byte) []byte {
-	if i := bytes.LastIndexByte(v, ','); i >= 0 {
-		v = v[i+1:]
-	}
-	return trimOWS(v)
-}
-
 // Well-known field names, lowercase. Comparison goes through EqualFold, so
 // only the length and the folded bytes matter.
 var (

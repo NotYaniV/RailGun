@@ -56,7 +56,10 @@ func AppendRequestHead(dst []byte, r *Request, close bool) []byte {
 
 	for i := 0; i < r.nhdr; i++ {
 		h := r.hdr[i]
-		if skipForward(h.Name, r.connVal) {
+		// Content-Length is re-emitted below from the parsed value. Copying
+		// it here as well sends it twice, which strict origins (NGINX among
+		// them) and this package's own parser reject as conflicting.
+		if skipForward(h.Name, r.connVal) || EqualFold(h.Name, nameContentLength) {
 			continue
 		}
 		dst = appendHeader(dst, h)

@@ -252,8 +252,9 @@ func parseHeaderLine(line []byte) (Header, error) {
 //   - Two Content-Length headers: same disagreement, one hop reads the first
 //     and one the last. Rejected even when they agree, because agreeing is not
 //     something this code should have to reason about.
-//   - Transfer-Encoding whose final coding is not "chunked": the body has no
-//     determinable end, so the connection cannot be safely reused.
+//   - Transfer-Encoding other than a single "chunked": a final coding that is
+//     not chunked leaves the body no determinable end, and one stacked under
+//     chunked would be lost when the header is re-emitted.
 //   - HTTP/1.1 without exactly one Host: the routing decision has no input.
 func (r *Request) resolveSemantics() error {
 	var (
@@ -313,10 +314,14 @@ func (r *Request) resolveSemantics() error {
 			}
 		case 17:
 			if EqualFold(name, nameTransferEncoding) {
-				sawTE = true
-				if !EqualFold(lastToken(val), tokChunked) {
+				// Exactly one Transfer-Encoding, exactly "chunked". Any other
+				// coding would be stripped by the serializer (the header is
+				// hop-by-hop and re-emitted as plain chunked), handing the
+				// peer a body still encoded in a coding it was never told of.
+				if sawTE || !EqualFold(val, tokChunked) {
 					return ErrBadTransferEnc
 				}
+				sawTE = true
 				r.Chunked = true
 			}
 		}

@@ -143,6 +143,11 @@ func (r *Response) parseStatusLine(line []byte) error {
 		}
 		code = code*10 + int(c-'0')
 	}
+	if code < 100 {
+		// Not a status code, and AppendInt would forward it as fewer than
+		// three digits, which is not a status line at all.
+		return ErrBadStatusLine
+	}
 	if len(rest) > 3 {
 		if rest[3] != ' ' {
 			return ErrBadStatusLine
@@ -208,10 +213,14 @@ func (r *Response) resolveSemantics() error {
 			}
 		case 17:
 			if EqualFold(name, nameTransferEncoding) {
-				sawTE = true
-				if !EqualFold(lastToken(val), tokChunked) {
+				// Exactly one Transfer-Encoding, exactly "chunked". Any other
+				// coding would be stripped by the serializer (the header is
+				// hop-by-hop and re-emitted as plain chunked), handing the
+				// peer a body still encoded in a coding it was never told of.
+				if sawTE || !EqualFold(val, tokChunked) {
 					return ErrBadTransferEnc
 				}
+				sawTE = true
 				r.Chunked = true
 			}
 		}

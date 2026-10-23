@@ -137,6 +137,12 @@ func (s *ChunkScanner) Scan(p []byte) (n int, done bool, err error) {
 			if s.trailerBytes > maxChunkLine*8 {
 				return n, false, ErrTrailerTooLarge
 			}
+			// Trailer lines are forwarded verbatim; hold them to the same
+			// field-line rules as the head so the origin cannot read one
+			// differently.
+			if _, err := parseHeaderLine(s.line[:s.nline]); err != nil {
+				return n, false, ErrBadChunkSize
+			}
 			s.nline = 0
 
 		case csDone:
@@ -174,9 +180,21 @@ func (s *ChunkScanner) readLine(p []byte) (n int, complete bool, err error) {
 // semicolon but not interpreting them.
 func parseChunkSize(line []byte) (int64, error) {
 	if i := bytes.IndexByte(line, ';'); i >= 0 {
+		// Extensions are forwarded verbatim, so they must at least be free of
+		// control bytes: a bare CR here ends the line for some origins and not
+		// for others, and the two would then frame the body differently.
+		if checkFieldValue(line[i+1:]) != nil {
+			return 0, ErrBadChunkSize
+		}
 		line = line[:i]
 	}
-	line = trimOWS(line)
+	// Trailing whitespace only (BWS before an extension). Leading whitespace
+	// is not in the grammar, and net/http rejects it.
+	j := len(line)
+	for j > 0 && isOWS(line[j-1]) {
+		j--
+	}
+	line = line[:j]
 	if len(line) == 0 || len(line) > 16 {
 		return 0, ErrBadChunkSize
 	}
