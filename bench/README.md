@@ -47,3 +47,21 @@ resolve the effect. That is not a win, and it must not be quoted as one. On a
 virtualised NIC the p99.9 jitter floor is routinely 50–200µs while proxy
 overhead differences are 20–50µs, so expect this verdict often and treat it as
 the harness working correctly.
+
+## Stress / robustness suite
+
+`bin/stress` (`make stress`) is a portable, stdlib-only suite for a *running*
+proxy: concurrency and object-size sweeps, open-loop rate steps, connection
+churn, pipelining and mixed-size framing checks with every body length
+verified, client aborts with leak checks, a soak with RSS sampling, slowloris /
+idle / slow-reader hostile clients, and 21 malformed or smuggling requests.
+It is not a performance claim against NGINX; that is still the rig's job.
+
+```bash
+./bin/stress -proxy 127.0.0.1:8080 -admin 127.0.0.1:9090 \
+  -pid $(pgrep -x railgun) -out stress-$(uname -s).json   # add -quick for a smoke run
+```
+
+Use the same flags on macOS and Linux and diff the JSON. `-admin` and `-pid`
+are optional. Exit status is non-zero if any objective check (framing, errors,
+leaks, starvation) fails; throughput rows are INFO. Raise `ulimit -n` first.

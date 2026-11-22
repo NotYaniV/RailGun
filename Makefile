@@ -1,4 +1,4 @@
-.PHONY: test test-linux build railgun origin bench fmt vet race lint
+.PHONY: test test-linux build railgun origin bench stress fmt vet race lint
 
 test:
 	go test ./...
@@ -29,7 +29,7 @@ vet:
 fmt:
 	gofmt -l -w .
 
-build: railgun origin bench
+build: railgun origin bench stress
 
 railgun:
 	go build -o bin/railgun ./cmd/railgun
@@ -58,3 +58,6 @@ e1:
 	@echo
 	@echo "=== block profile ==="
 	go tool pprof -text -nodecount=10 $(E1_OUT)/upstream.test $(E1_OUT)/block.out
+
+stress:
+	go build -o bin/stress ./bench/cmd/stress
